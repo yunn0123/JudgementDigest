@@ -1013,7 +1013,11 @@ if __name__ == "__main__":
         print(f"完成！共爬取 {res['collected']} 筆裁判書"
               f"（該區間總筆數 {res['total']}）。")
         if res["truncated"]:
-            print(f"  ⚠ 結果集達單一查詢上限 {_RESULT_LIMIT} 筆，較舊的資料未取得。")
-            print("    請改用 crawl_batched.py，它會自動細分日期區間直到每段低於上限。")
+            print(f"  ⚠ 結果集達單一查詢上限 {_RESULT_LIMIT} 筆"
+                  f"（該條件共 {res['total']} 筆）→ 已改用法院分群逐桶收集。")
+            print("    法院分群的涵蓋上限為「各法院取前 500 筆」之總和，")
+            print("    若某法院在此條件下超過 500 筆，其較舊的部分仍取不到。")
+            print("    需要完整資料請改用 crawl_batched.py —— 它會自動細分裁判日期區間，")
+            print("    把每段壓到 500 筆以下，不受此限制。")
     else:
         ap.print_help()
