@@ -21,6 +21,7 @@ import sys
 import io
 import time
 from datetime import date, datetime
+from typing import Optional
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -35,6 +36,8 @@ def run(
     start_date: date,
     end_date: date,
     skip_crawl: bool,
+    case_year_start: Optional[int] = None,
+    case_year_end:   Optional[int] = None,
 ) -> None:
     sep = "=" * 60
 
@@ -61,6 +64,8 @@ def run(
                 start_date=start_date,
                 end_date=end_date,
                 headless=headless,
+                case_year_start=case_year_start,
+                case_year_end=case_year_end,
             )
         except Exception as exc:
             print(f"  [ERROR] 爬取失敗: {exc}")
@@ -142,6 +147,14 @@ if __name__ == "__main__":
         "--end-date", default="",
         help="裁判日期迄 YYYY/MM/DD（西元；覆蓋 --end-year）",
     )
+    ap.add_argument(
+        "--case-year-start", type=int, default=None,
+        help="案號年度起（民國年，如 113）；與裁判日期是不同維度，伺服器端分群",
+    )
+    ap.add_argument(
+        "--case-year-end", type=int, default=None,
+        help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，伺服器端分群",
+    )
     # 其他選項
     ap.add_argument("--no-headless", action="store_true", help="顯示瀏覽器視窗（debug 用）")
     ap.add_argument("-o", "--output", default="",         help="輸出 Excel 檔名")
@@ -172,6 +185,8 @@ if __name__ == "__main__":
         headless=not args.no_headless,
         output=args.output,
         full_text=args.full_text,
+        case_year_start=args.case_year_start,
+        case_year_end=args.case_year_end,
         start_date=sd,
         end_date=ed,
         skip_crawl=args.skip_crawl,

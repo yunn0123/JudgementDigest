@@ -94,12 +94,19 @@ def batched_crawl(
     start_date: date,
     end_date: date,
     headless: bool,
+    case_year_start: Optional[int] = None,
+    case_year_end:   Optional[int] = None,
 ) -> int:
     """
     依裁判日期遞迴細分爬取，嚴格由新到舊。
 
     使用 LIFO 堆疊：切分後把「較舊的半段」先推入、「較新的半段」後推入，
     於是較新的半段會先被彈出處理，確保整體順序始終是新 → 舊。
+
+    case_year_start / case_year_end 為案號年度（民國年），與裁判日期是獨立維度，
+    原樣傳給 search_and_crawl 由伺服器端年度分群處理。
+    注意：切分決策看的是「未經案號年度過濾」的 total，
+    因此即使過濾後筆數不多，原區間仍可能被切開 —— 多切幾次而已，正確性不受影響。
     """
     init_db()
 
@@ -139,6 +146,8 @@ def batched_crawl(
                 start_date=_fmt(cs),
                 end_date=_fmt(ce),
                 driver=driver,
+                case_year_start=case_year_start,
+                case_year_end=case_year_end,
                 # 單日已無法再細分 → 不再探測，直接把能拿的拿走
                 skip_if_truncated=not single_day,
             )
@@ -221,6 +230,14 @@ if __name__ == "__main__":
         help="裁判日期迄 YYYY/MM/DD（西元；覆蓋 --end-year）",
     )
     ap.add_argument(
+        "--case-year-start", type=int, default=None,
+        help="案號年度起（民國年，如 113）；與裁判日期是不同維度，伺服器端分群",
+    )
+    ap.add_argument(
+        "--case-year-end", type=int, default=None,
+        help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，伺服器端分群",
+    )
+    ap.add_argument(
         "--no-headless", action="store_true",
         help="顯示瀏覽器視窗（debug 用）",
     )
@@ -247,5 +264,7 @@ if __name__ == "__main__":
         start_date=sd,
         end_date=ed,
         headless=not args.no_headless,
+        case_year_start=args.case_year_start,
+        case_year_end=args.case_year_end,
     )
     print(f"\n完成！共新增 {total} 筆裁判書至資料庫。")

@@ -6,7 +6,7 @@
 
 - 關鍵字搜尋，依裁判日期遞迴細分區間，突破單一查詢 500 筆上限
 - 裁判日期為伺服器端篩選，精確到日
-- 案號年度為伺服器端分群篩選，與裁判日期是各自獨立的維度（目前僅 `crawler.py` 支援）
+- 案號年度為伺服器端分群篩選，與裁判日期是各自獨立的維度，可任意組合
 - 解析 20+ 個欄位：裁判字號、法院、當事人、主文、事實及理由、法官等
 - 支援所有法院類型，包含憲法法庭特殊格式
 - 匯出格式化 Excel，含法院分布統計摘要
@@ -42,6 +42,8 @@ python pipeline.py <keyword> -n <筆數> [選項]
 | `--end-year <年>` | 搜尋結束年（西元），預設今年 |
 | `--start-date <日期>` | 裁判日期起，格式 `YYYY/MM/DD`（西元），會覆蓋 `--start-year` |
 | `--end-date <日期>` | 裁判日期迄，格式 `YYYY/MM/DD`（西元），會覆蓋 `--end-year` |
+| `--case-year-start <年>` | 案號年度起（民國年，如 `113`），伺服器端分群 |
+| `--case-year-end <年>` | 案號年度迄（民國年，如 `115`），伺服器端分群 |
 | `--no-headless` | 顯示瀏覽器視窗，方便除錯觀察 |
 | `-o <檔名>` | 指定輸出 Excel 檔名，預設自動加時間戳 |
 | `--full-text` | Excel 含完整全文欄位（檔案較大） |
@@ -63,6 +65,9 @@ python pipeline.py 借名登記 -n 500 --start-date 2024/01/01 --end-date 2024/1
 
 # 顯示瀏覽器視窗（除錯用）
 python pipeline.py 借名登記 -n 100 --no-headless
+
+# 裁判日期 + 案號年度（兩個獨立維度，可組合）
+python pipeline.py 借名登記 -n 500 --start-date 2024/01/01 --end-date 2024/12/31 --case-year-start 113 --case-year-end 113
 
 # 跳過爬取，只重新解析 + 匯出
 python pipeline.py 借名登記 --skip-crawl
@@ -88,10 +93,9 @@ python crawl_batched.py <keyword> -n <筆數> [選項]
 | `--end-year <年>` | 搜尋結束年（西元） |
 | `--start-date <日期>` | 裁判日期起 `YYYY/MM/DD`（西元，伺服器端精確篩選） |
 | `--end-date <日期>` | 裁判日期迄 `YYYY/MM/DD`（西元，伺服器端精確篩選） |
+| `--case-year-start <年>` | 案號年度起（民國年，如 `113`），伺服器端分群 |
+| `--case-year-end <年>` | 案號年度迄（民國年，如 `115`），伺服器端分群 |
 | `--no-headless` | 顯示瀏覽器視窗 |
-
-> 案號年度篩選（`--case-year-start` / `--case-year-end`）目前僅 `crawler.py` 支援，
-> 見下方「單次爬取」。`crawl_batched.py` 尚未串接此參數。
 
 ```bash
 python crawl_batched.py 借名登記 -n 1000
@@ -167,12 +171,12 @@ python crawler.py <keyword> -n <筆數> [選項]
 python crawler.py 借名登記 -n 20 --start-date 2024/03/01 --end-date 2024/03/07
 
 # 裁判日期 + 案號年度（兩個獨立維度）
-python crawler.py 借名登記 -n 20 --start-date 2024/01/01 --end-date 2024/02/14                   --case-year-start 113 --case-year-end 113
+python crawler.py 借名登記 -n 20 --start-date 2024/01/01 --end-date 2024/02/14 --case-year-start 113 --case-year-end 113
 ```
 
-> **單次查詢上限 500 筆。** 若該條件的結果超過 500 筆，程式會提示改用
-> `crawl_batched.py`（它會自動細分日期區間）。因此「案號年度篩選」與
-> 「超過 500 筆」目前無法併用。
+> **單次查詢上限 500 筆。** `crawler.py` 只查詢一次、不做日期切分，
+> 結果超過 500 筆時會提示改用 `crawl_batched.py` 或 `pipeline.py`
+> —— 它們會自動細分日期區間，且同樣支援案號年度篩選。
 
 ---
 
