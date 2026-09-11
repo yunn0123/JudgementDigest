@@ -357,6 +357,33 @@ def _collect_court_links(driver: webdriver.Chrome) -> List[Tuple[str, str]]:
     return court_links
 
 
+def _collect_year_links(driver: webdriver.Chrome) -> List[Tuple[str, int, bool]]:
+    """
+    從搜尋結果摘要頁收集「依案號年度分群」子連結（?gy=jyear&gc=<民國年>）。
+    回傳 [(url, 年度, 是否為統括桶), ...]，依年度由新到舊排序。
+
+    gc 為負值（例如 -110）代表「該年以前」的統括桶，涵蓋多個年度，
+    因此仍需搭配本地過濾才能精確切到使用者指定的範圍。
+    必須在離開摘要頁前呼叫 —— 導覽到 qryresultlst.aspx 後這些連結就不存在了。
+    """
+    out: List[Tuple[str, int, bool]] = []
+    seen: set = set()
+    for lnk in driver.find_elements(By.CSS_SELECTOR, "a[href*='gy=jyear']"):
+        href = lnk.get_attribute("href") or ""
+        m = re.search(r"gy=jyear&gc=(-?\d+)", href)
+        if not m:
+            continue
+        raw = int(m.group(1))
+        if raw in seen:
+            continue
+        seen.add(raw)
+        out.append((href, abs(raw), raw < 0))
+    # 由新到舊；統括桶（負值）年度較舊，排在同年度之後
+    out.sort(key=lambda t: (t[1], not t[2]), reverse=True)
+    logger.info("Collected %d year sub-links", len(out))
+    return out
+
+
 def _case_number_year(url: str) -> Optional[int]:
     """
     從 data.aspx?ty=JD&id=COURT,YEAR,TYPE,NUM,DATE 解析「字號年度」（ROC）。
@@ -649,9 +676,11 @@ def search_and_crawl(
 
     參數：
       start_date / end_date       裁判日期起迄（西元 YYYY/MM/DD），伺服器端篩選
-      case_year_start / _end      案號年度起迄（民國年），Python 層後過濾。
-                                  進階搜尋的 jud_year 必須與字別、案號同時給定，
-                                  無法單獨當範圍條件，故只能在本地過濾。
+      case_year_start / _end      案號年度起迄（民國年）。以伺服器端年度分群
+                                  （?gy=jyear&gc=<年>）只取符合的年度桶，
+                                  並保留本地過濾切精確邊界（統括桶需要）。
+                                  註：進階搜尋的 jud_year 須與字別、案號同時給定，
+                                  無法單獨當範圍條件，故走分群而非表單欄位。
       driver                      傳入既有 driver 可跨多次呼叫重複使用（不會被關閉）
       skip_if_truncated           True 時，一旦偵測到結果被截斷就立即返回不翻頁
 
@@ -667,6 +696,7 @@ def search_and_crawl(
     total: Optional[int] = None
     truncated = False
     court_links: List[Tuple[str, str]] = []
+    year_links:  List[Tuple[str, int, bool]] = []
 
     try:
         # ── 1. 進階搜尋取得該日期區間專屬的結果集 ─────────────────────
@@ -695,6 +725,24 @@ def search_and_crawl(
             court_links = _collect_court_links(driver)
             if court_links:
                 logger.info("Fallback: subdividing by court (%d courts)", len(court_links))
+
+        # 指定案號年度時，改用伺服器端的年度分群（?gy=jyear&gc=<年>），
+        # 只取回符合的年度而非整個日期區間，可省下大量無用翻頁。
+        # gy/gc 一次只能用一條軸 —— 若已因單日超限而啟用法院分群，
+        # 該區段就讓法院軸優先，案號年度退回本地過濾（正確性不受影響）。
+        if (case_year_start is not None or case_year_end is not None) and not court_links:
+            year_links = _collect_year_links(driver)
+            if year_links:
+                _lo = case_year_start if case_year_start is not None else -10 ** 6
+                _hi = case_year_end   if case_year_end   is not None else 10 ** 6
+                # 一般桶：年度落在範圍內即取；
+                # 統括桶（涵蓋「該年及更早」）：只要其上界不低於 _lo 就可能有符合資料
+                year_links = [
+                    (u, y, catch) for (u, y, catch) in year_links
+                    if (_lo <= y <= _hi) or (catch and y >= _lo)
+                ]
+                logger.info("Case-year %s~%s → %d year bucket(s) server-side",
+                            case_year_start, case_year_end, len(year_links))
 
         # ── 3. Phase A: 翻頁收集案件連結（新 → 舊）────────────────────
         logger.info("Phase A: collecting case URLs …")
@@ -741,6 +789,24 @@ def search_and_crawl(
                 driver.get(court_url)
                 time.sleep(2.0)
                 _paginate(f"  [{court_label}]")
+        elif year_links:
+            # 伺服器端案號年度篩選：只翻符合年度的桶（由新到舊）。
+            # _paginate 內仍會套用本地過濾 —— 統括桶需要它才能精確切到範圍，
+            # 同時也是伺服器端篩選若失效時的安全網。
+            for year_url, roc, is_catch_all in year_links:
+                if len(all_items) >= max_results:
+                    break
+                tag = f"ROC{roc}{'以前' if is_catch_all else ''}"
+                logger.info("  [CaseYear] %s", tag)
+                driver.get(year_url)
+                time.sleep(2.0)
+                _before = len(all_items)
+                _paginate(f"  [{tag}]")
+                if len(all_items) - _before >= _RESULT_LIMIT:
+                    logger.warning(
+                        "  ⚠ 年度桶 %s 取得 %d 筆已達上限，該桶可能仍有遺漏",
+                        tag, len(all_items) - _before,
+                    )
         else:
             driver.get(base_results_url)
             time.sleep(2.5)
@@ -923,9 +989,9 @@ if __name__ == "__main__":
     ap.add_argument("--end-date",   default="",
                     help="裁判日期迄 YYYY/MM/DD（西元，伺服器端精確篩選）")
     ap.add_argument("--case-year-start", type=int, default=None,
-                    help="案號年度起（民國年，如 113）；與裁判日期是不同維度，於本地過濾")
+                    help="案號年度起（民國年，如 113）；與裁判日期是不同維度，伺服器端分群")
     ap.add_argument("--case-year-end",   type=int, default=None,
-                    help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，於本地過濾")
+                    help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，伺服器端分群")
     ap.add_argument("--recrawl-stubs", action="store_true",
                     help="重新爬取資料庫中所有 stub/不完整 HTML（不需關鍵字）")
     args = ap.parse_args()
