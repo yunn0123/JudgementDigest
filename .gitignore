@@ -8,7 +8,7 @@ __pycache__/
 
 # 資料（不入版控）
 html_cache/
-judgments.db
+judgments.db*
 *.xlsx
 *.log
 
