@@ -125,22 +125,22 @@ if __name__ == "__main__":
     )
 
     # 日期選項
-    date_grp = ap.add_argument_group("日期範圍（二擇一）")
+    date_grp = ap.add_argument_group("裁判日期範圍（二擇一）")
     date_grp.add_argument(
         "--start-year", type=int, default=2015,
-        help="搜尋起始年（預設: 2015）",
+        help="裁判日期起始年（西元，預設: 2015）",
     )
     date_grp.add_argument(
         "--end-year", type=int, default=None,
-        help="搜尋結束年（預設: 今年）",
+        help="裁判日期結束年（西元，預設: 今年）",
     )
     date_grp.add_argument(
         "--start-date", default="",
-        help="起始日期 YYYY/MM/DD（覆蓋 --start-year）",
+        help="裁判日期起 YYYY/MM/DD（西元；覆蓋 --start-year）",
     )
     date_grp.add_argument(
         "--end-date", default="",
-        help="結束日期 YYYY/MM/DD（覆蓋 --end-year）",
+        help="裁判日期迄 YYYY/MM/DD（西元；覆蓋 --end-year）",
     )
     # 其他選項
     ap.add_argument("--no-headless", action="store_true", help="顯示瀏覽器視窗（debug 用）")

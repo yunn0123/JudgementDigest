@@ -3,7 +3,9 @@ Part 1 — 司法院裁判書自動爬蟲
 目標網站: https://judgment.judicial.gov.tw/FJUD/default.aspx
 
 使用方式:
-    python crawler.py <關鍵字> [-n 筆數] [--no-headless] [--start-date YYYY/MM/DD] [--end-date YYYY/MM/DD]
+    python crawler.py <關鍵字> [-n 筆數] [--no-headless]
+                      [--start-date YYYY/MM/DD] [--end-date YYYY/MM/DD]
+                      [--case-year-start 民國年] [--case-year-end 民國年]
 
 範例:
     python crawler.py 詐欺 -n 20
@@ -371,6 +373,130 @@ def _case_number_year(url: str) -> Optional[int]:
     return None
 
 
+def _judgment_date(url: str) -> str:
+    """
+    從 data.aspx?ty=JD&id=COURT,YEAR,TYPE,NUM,DATE 解析「裁判日期」，回傳 ISO(西元) YYYY-MM-DD。
+    例：id=TPHV,112,上,750,20260422 → "2026-04-22"
+    與 _case_number_year() 取的「案號年度」是兩回事：兩者可相差數年。
+    解析失敗回傳空字串。
+    """
+    try:
+        id_part = url.split("id=", 1)[1].split("&")[0]
+        parts   = unquote(id_part).split(",")
+        if len(parts) >= 5:
+            raw = parts[4].strip()
+            if len(raw) == 8 and raw.isdigit():
+                return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    except Exception:
+        pass
+    return ""
+
+
+# ─── 進階搜尋（default_AD.aspx）───────────────────────────────────────────────
+# 簡易搜尋只能用 ?gy=/&gc= 分群，而 gy/gc 是「單一互斥軸」（法院、年度、審級三選一），
+# 且每個結果集硬性上限 500 筆 —— 單靠分群無法取得超過 500 筆的完整資料。
+# 進階搜尋可把裁判日期寫進查詢本身，每個日期區間產生獨立的 q= hash、
+# 各自享有自己的 500 額度，因此切到每段 < 500 就能完整取得。
+_RESULT_LIMIT = 500          # 單一結果集可翻取的硬性上限
+_AD_DATE_FIELDS = ("dy1", "dm1", "dd1", "dy2", "dm2", "dd2")
+
+
+def _roc_parts(date_str: str) -> Optional[Tuple[int, int, int]]:
+    """西元 YYYY/MM/DD（或 YYYY-MM-DD）→ (民國年, 月, 日)。"""
+    try:
+        y, m, d = re.split(r"[/-]", date_str.strip())
+        return int(y) - 1911, int(m), int(d)
+    except Exception:
+        return None
+
+
+def _dismiss_alert(driver: webdriver.Chrome) -> str:
+    """
+    關閉可能出現的 JS alert 並回傳其文字。
+    進階搜尋的表單驗證失敗會跳 alert（例如裁判字號填不完整），
+    未處理會讓後續所有 driver 操作拋 UnexpectedAlertPresentException。
+    """
+    try:
+        alert = driver.switch_to.alert
+        text  = alert.text
+        alert.accept()
+        logger.warning("Dismissed alert: %s", text)
+        return text
+    except Exception:
+        return ""
+
+
+def _result_total(driver: webdriver.Chrome) -> Optional[int]:
+    """
+    從搜尋結果摘要頁取得總筆數（頁面顯示為「查詢結果 4082」）。
+    取不到回傳 None（呼叫端應保守地當作可能超過上限）。
+    """
+    for css in ("div[id*='ount']", "span[id*='ount']", "#jud_count"):
+        for el in driver.find_elements(By.CSS_SELECTOR, css):
+            m = re.search(r"查詢結果\s*([\d,]+)", el.text or "")
+            if m:
+                return int(m.group(1).replace(",", ""))
+    try:
+        m = re.search(r"查詢結果\s*([\d,]+)",
+                      driver.find_element(By.TAG_NAME, "body").text)
+        if m:
+            return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+    return None
+
+
+def _ad_search(
+    driver:     webdriver.Chrome,
+    keyword:    str,
+    start_date: str = "",
+    end_date:   str = "",
+) -> Tuple[Optional[str], Optional[int]]:
+    """
+    在進階搜尋頁送出「關鍵字 + 裁判日期區間」查詢。
+    日期以民國年月日分別填入 dy1/dm1/dd1（起）與 dy2/dm2/dd2（迄）。
+    回傳 (結果列表 URL, 總筆數)；查詢失敗回傳 (None, None)。
+    """
+    driver.get(BASE_URL_AD)
+    time.sleep(2.5)
+    _dismiss_alert(driver)
+
+    if keyword:
+        kw = driver.find_element(By.ID, "jud_kw")
+        kw.clear()
+        kw.send_keys(keyword)
+
+    values = {}
+    for label, ds in (("1", start_date), ("2", end_date)):
+        if not ds:
+            continue
+        parts = _roc_parts(ds)
+        if parts is None:
+            logger.warning("Cannot parse date %r — ignored", ds)
+            continue
+        values[f"dy{label}"], values[f"dm{label}"], values[f"dd{label}"] = parts
+
+    for fid in _AD_DATE_FIELDS:
+        if fid in values:
+            el = driver.find_element(By.ID, fid)
+            el.clear()
+            el.send_keys(str(values[fid]))
+
+    driver.find_element(By.ID, "btnQry").click()
+    time.sleep(3.5)
+
+    alert_text = _dismiss_alert(driver)
+    if alert_text:
+        logger.error("Advanced search rejected: %s", alert_text)
+        return None, None
+
+    total = _result_total(driver)
+    url   = _get_results_list_url(driver)
+    logger.info("AD search [%s ~ %s] → total=%s",
+                start_date or "*", end_date or "*", total)
+    return url, total
+
+
 # ─── Step B: 從結果列表頁解析個別案件 ────────────────────────────────────────
 # qryresultlst.aspx 上每筆案件的連結指向
 # data.aspx?ty=JD&id=<court>,<year>,<type>,<num>,<date>
@@ -417,15 +543,18 @@ def _parse_case_rows(driver: webdriver.Chrome) -> List[Dict]:
             rows.append({
                 "case_number":   case_number,
                 "court":         court,
-                "judgment_date": tds[2].text.strip() if len(tds) > 2 else "",
+                # 裁判日期以 URL id 第 5 欄為準（西元 ISO，可直接字串比較/排序）；
+                # td 版型若變動仍可用，故保留 td 文字作為備援。
+                "judgment_date": _judgment_date(href) or (
+                    tds[2].text.strip() if len(tds) > 2 else ""),
                 "case_title":    tds[3].text.strip() if len(tds) > 3 else "",
                 "url":           href,
             })
         except Exception:
             rows.append({
                 "case_number": case_number,
-                "court": court, "judgment_date": "", "case_title": "",
-                "url": href,
+                "court": court, "judgment_date": _judgment_date(href),
+                "case_title": "", "url": href,
             })
 
     logger.info("Found %d cases on current page", len(rows))
@@ -504,242 +633,130 @@ def search_and_crawl(
     headless:    bool = True,
     start_date:  str  = "",
     end_date:    str  = "",
-) -> int:
+    case_year_start: Optional[int] = None,
+    case_year_end:   Optional[int] = None,
+    driver:      Optional[webdriver.Chrome] = None,
+    skip_if_truncated: bool = False,
+) -> Dict[str, object]:
     """
-    搜尋並爬取裁判書。
+    以「關鍵字 + 裁判日期區間」搜尋並爬取裁判書。
 
     流程：
-      1. default.aspx 輸入關鍵字 → 送出查詢
-      2. 等待 qryresultlst.aspx 結果列表連結出現 → 導航過去
-      3. 在結果列表頁找個別 data.aspx 案件連結 → 逐一下載 HTML
-      4. 翻頁直到達到 max_results
+      1. default_AD.aspx 進階搜尋：關鍵字 + 裁判日期起迄 → 取得該區間專屬的 q= hash
+      2. 讀摘要頁「查詢結果 N」判斷是否超過單一結果集上限（_RESULT_LIMIT=500）
+      3. 未超過 → 翻頁收集所有案件連結；超過 → 回報 truncated 交由呼叫端切分日期區間
+      4. 逐一下載案件 HTML
+
+    參數：
+      start_date / end_date       裁判日期起迄（西元 YYYY/MM/DD），伺服器端篩選
+      case_year_start / _end      案號年度起迄（民國年），Python 層後過濾。
+                                  進階搜尋的 jud_year 必須與字別、案號同時給定，
+                                  無法單獨當範圍條件，故只能在本地過濾。
+      driver                      傳入既有 driver 可跨多次呼叫重複使用（不會被關閉）
+      skip_if_truncated           True 時，一旦偵測到結果被截斷就立即返回不翻頁
+
+    回傳 {"collected": 實際下載數, "total": 該區間總筆數, "truncated": 是否被截斷}
     """
     os.makedirs(HTML_DIR, exist_ok=True)
     init_db()
 
-    driver    = build_driver(headless)
-    wait      = WebDriverWait(driver, 30)
+    own_driver = driver is None
+    if own_driver:
+        driver = build_driver(headless)
     collected = 0
+    total: Optional[int] = None
+    truncated = False
+    court_links: List[Tuple[str, str]] = []
 
     try:
-        # ── 1. 關鍵字搜尋（簡易搜尋頁）取得查詢 hash ─────────────────
-        # 日期篩選不走表單（進階搜尋頁在 headless 模式下 input 無法互動），
-        # 改用搜尋結果的年度分群 URL（?gy=jyear&gc=<ROC年>）做篩選。
-        # 若 driver.get(BASE_URL) 因 renderer 崩潰而失敗，最多重試 2 次。
-        logger.info("Opening search page: %s", BASE_URL)
-        for _attempt in range(3):
-            try:
-                driver.get(BASE_URL)
-                break
-            except TimeoutException as _exc:
-                logger.warning("driver.get(BASE_URL) timed out (attempt %d/3) — stopping page load",
-                               _attempt + 1)
-                try:
-                    driver.execute_script("window.stop();")
-                except Exception:
-                    pass
-                break  # 頁面可能部分載入，繼續嘗試找輸入框
-            except WebDriverException as _exc:
-                if _attempt == 2:
-                    raise
-                logger.warning("driver.get(BASE_URL) failed (attempt %d/3): %s — rebuilding driver",
-                               _attempt + 1, _exc)
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                time.sleep(15)
-                driver = build_driver(headless)
-                wait   = WebDriverWait(driver, 30)
-        time.sleep(3)
-
-        # 找關鍵字輸入框
-        kw_input = None
-        for kw_id in ("txtKW", "KeyWord", "kw"):
-            try:
-                kw_input = wait.until(EC.presence_of_element_located((By.ID, kw_id)))
-                break
-            except TimeoutException:
-                pass
-        if kw_input is None:
-            inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
-            kw_input = inputs[0] if inputs else None
-        if kw_input is None:
-            logger.error("Cannot find keyword input — aborting")
-            return 0
-
-        kw_input.clear()
-        kw_input.send_keys(keyword)
-        logger.info("Keyword entered: %s", keyword)
-
-        # 點擊查詢按鈕
-        # TimeoutException 表示頁面超過 page_load_timeout 秒才載入完成；
-        # 用 window.stop() 停止繼續等待，後續再確認是否有結果。
-        clicked = False
-        for btn_id in ("btnSimpleQry", "btnQuery", "BtnQuery", "Query"):
-            try:
-                driver.find_element(By.ID, btn_id).click()
-                clicked = True
-                break
-            except NoSuchElementException:
-                pass
-            except TimeoutException:
-                logger.warning("Search button click timed out — stopping page load and continuing")
-                try:
-                    driver.execute_script("window.stop();")
-                except Exception:
-                    pass
-                clicked = True
-                break
-        if not clicked:
-            try:
-                driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
-                clicked = True
-            except NoSuchElementException:
-                pass
-            except TimeoutException:
-                logger.warning("Submit button click timed out — stopping page load and continuing")
-                try:
-                    driver.execute_script("window.stop();")
-                except Exception:
-                    pass
-                clicked = True
-        if not clicked:
-            logger.error("Cannot find search button — aborting")
-            return 0
-
-        logger.info("Search submitted, waiting for results link …")
-        time.sleep(2)
-
-        # ── 2. 取得查詢 hash URL，同時收集法院子連結 ─────────────────
-        # 法院子連結（?gy=jcourt&gc=<code>）出現在 default.aspx 搜尋結果摘要頁，
-        # 導覽至 qryresultlst.aspx 之後就看不到了，必須在此時收集。
-        base_results_url = _get_results_list_url(driver)
+        # ── 1. 進階搜尋取得該日期區間專屬的結果集 ─────────────────────
+        base_results_url, total = _ad_search(driver, keyword, start_date, end_date)
         if not base_results_url:
-            logger.error("Cannot find results list URL — aborting")
-            return 0
-        logger.info("Base results URL: %s", base_results_url)
+            logger.error("Advanced search returned no results URL — aborting")
+            return {"collected": 0, "total": total, "truncated": False}
 
-        # 等待法院分群側邊欄渲染後再收集（伺服器較慢時側邊欄可能延後出現）
-        time.sleep(4)
-        court_links = _collect_court_links(driver)
-        logger.info("Collected %d court sub-links from search result page", len(court_links))
+        # ── 2. 判斷是否觸及單一結果集上限 ─────────────────────────────
+        # 結果按裁判日期由新到舊排序，截斷時被砍掉的是最舊的部分。
+        if total is not None and total >= _RESULT_LIMIT:
+            truncated = True
+            logger.warning(
+                "Result set truncated: total=%d >= limit=%d  [%s ~ %s]",
+                total, _RESULT_LIMIT, start_date or "*", end_date or "*",
+            )
+            if skip_if_truncated:
+                logger.info("skip_if_truncated — returning for caller to split")
+                return {"collected": 0, "total": total, "truncated": True}
 
-        # ── 3. 決定 ROC 年度範圍 ──────────────────────────────────────
-        def _date_to_roc(date_str: str) -> int:
-            return int(date_str.replace("/", "-").split("-")[0]) - 1911
+            # 呼叫端表示已無法再切分日期（例如區間已縮到單日），
+            # 最後手段：改用法院分群把同一個日期區間再切細。
+            # gy=jcourt 與日期條件不衝突 —— 日期在查詢裡，法院是該結果集的分群，
+            # 每個法院桶各自獨立計算 500 額度。
+            # 必須在離開摘要頁前收集，導覽到 qryresultlst.aspx 後就看不到這些連結。
+            court_links = _collect_court_links(driver)
+            if court_links:
+                logger.info("Fallback: subdividing by court (%d courts)", len(court_links))
 
-        if start_date or end_date:
-            today_roc = datetime.now().year - 1911
-            start_roc = _date_to_roc(start_date) if start_date else 104
-            end_roc   = _date_to_roc(end_date)   if end_date   else today_roc
-        else:
-            start_roc = end_roc = None
-
-        if start_roc is not None:
-            roc_years = list(range(end_roc, start_roc - 1, -1))  # 新 → 舊
-        else:
-            roc_years = [None]
-
-        # ── 4. Phase A: 法院逐一收集，Python 層做年度範圍過濾 ─────────
-        # 策略 A（有法院子連結）：
-        #   每個法院 URL（?gy=jcourt&gc=<code>）只導覽一次，
-        #   再用「字號年度」在 Python 層過濾到目標年度範圍。
-        #   這樣 25 個法院只需 25 次導覽，而非「年度數 × 法院數」次。
-        #
-        # 策略 B（無法院子連結，fallback）：
-        #   逐年度直接導覽年度篩選頁（?gy=jyear&gc=<year>）並翻頁收集。
+        # ── 3. Phase A: 翻頁收集案件連結（新 → 舊）────────────────────
         logger.info("Phase A: collecting case URLs …")
         all_items: List[Dict] = []
+        seen_urls: set = set()
+
+        def _filter_by_case_year(items: List[Dict]) -> List[Dict]:
+            """案號年度後過濾（與裁判日期是兩個不同維度，可各自獨立指定）。"""
+            if case_year_start is None and case_year_end is None:
+                return items
+            lo = case_year_start if case_year_start is not None else -10 ** 6
+            hi = case_year_end   if case_year_end   is not None else 10 ** 6
+            return [
+                it for it in items
+                if _case_number_year(it.get("url", "")) is None
+                or lo <= _case_number_year(it.get("url", "")) <= hi
+            ]
+
+        def _paginate(label: str) -> None:
+            """從目前頁面一路翻頁收集，直到無下一頁或達 max_results。"""
+            while len(all_items) < max_results:
+                raw_items = _parse_case_rows(driver)
+                if not raw_items:
+                    break
+                fresh = [it for it in _filter_by_case_year(raw_items)
+                         if it.get("url") and it["url"] not in seen_urls]
+                needed = max_results - len(all_items)
+                for it in fresh[:needed]:
+                    seen_urls.add(it["url"])
+                    all_items.append(it)
+                logger.info("  %d / %d collected%s", len(all_items), max_results, label)
+                if len(all_items) >= max_results:
+                    break
+                if not _go_next_page(driver):
+                    break
+                time.sleep(0.6)
 
         if court_links:
-            logger.info("Strategy A: %d courts (year range ROC%s–ROC%s)",
-                        len(court_links),
-                        start_roc if start_roc is not None else "?",
-                        end_roc   if end_roc   is not None else "?")
-
+            # 最後手段路徑：同一日期區間內再依法院逐桶收集
             for court_url, court_label in court_links:
                 if len(all_items) >= max_results:
                     break
                 logger.info("  [Court] %s", court_label)
                 driver.get(court_url)
-                time.sleep(2)
-
-                while len(all_items) < max_results:
-                    raw_items = _parse_case_rows(driver)
-                    if not raw_items:
-                        break
-
-                    # ?gy=jcourt 傳回該法院所有年度；用字號年度做範圍過濾
-                    if start_roc is not None:
-                        page_items = [
-                            it for it in raw_items
-                            if _case_number_year(it.get("url", "")) is None
-                            or start_roc <= _case_number_year(it.get("url", "")) <= end_roc
-                        ]
-
-                        # 若本頁所有可解析的年度都比 start_roc 還舊，
-                        # 代表後續頁面（更舊）也不會有符合的案件 → 提早結束此法院
-                        if not page_items:
-                            page_years = [
-                                _case_number_year(it.get("url", ""))
-                                for it in raw_items
-                            ]
-                            known_years = [y for y in page_years if y is not None]
-                            if known_years and max(known_years) < start_roc:
-                                logger.info(
-                                    "    All cases on this page (max year ROC%d) older than "
-                                    "range start ROC%d — stopping [%s]",
-                                    max(known_years), start_roc, court_label,
-                                )
-                                break
-                    else:
-                        page_items = raw_items
-
-                    needed = max_results - len(all_items)
-                    all_items.extend(page_items[:needed])
-                    logger.info(
-                        "    %d / %d  [%s]",
-                        len(all_items), max_results, court_label,
-                    )
-
-                    if len(all_items) >= max_results:
-                        break
-                    if not page_items:
-                        # 過濾後無符合案件但尚未超出範圍 → 繼續翻頁
-                        if not _go_next_page(driver):
-                            break
-                        continue
-                    if not _go_next_page(driver):
-                        break
+                time.sleep(2.0)
+                _paginate(f"  [{court_label}]")
         else:
-            # Fallback：無法院子連結，逐年度直接翻頁
-            logger.info("Strategy B (fallback): year URL pagination")
-            for roc_year in roc_years:
-                if len(all_items) >= max_results:
-                    break
+            driver.get(base_results_url)
+            time.sleep(2.5)
+            _paginate("")
 
-                if roc_year is not None:
-                    lst_url = f"{base_results_url}&gy=jyear&gc={roc_year}"
-                    logger.info("── Year ROC%d ──", roc_year)
-                else:
-                    lst_url = base_results_url
-                    logger.info("── All years ──")
-
-                driver.get(lst_url)
-                time.sleep(2)
-
-                while len(all_items) < max_results:
-                    page_items = _parse_case_rows(driver)
-                    if not page_items:
-                        break
-                    needed = max_results - len(all_items)
-                    all_items.extend(page_items[:needed])
-                    logger.info("  %d / %d  [fallback ROC%s]", len(all_items), max_results, roc_year)
-                    if len(all_items) >= max_results:
-                        break
-                    if not _go_next_page(driver):
-                        break
+        # 防護：摘要頁的總筆數若讀不到（頁面改版等），改以「恰好收滿上限」反推截斷。
+        # 未指定案號年度過濾時，收到剛好 _RESULT_LIMIT 筆幾乎必然代表被截斷。
+        if (total is None and not truncated and not court_links
+                and case_year_start is None and case_year_end is None
+                and len(all_items) >= _RESULT_LIMIT
+                and max_results >= _RESULT_LIMIT):
+            truncated = True
+            logger.warning(
+                "Total unknown but collected exactly %d — assuming truncated  [%s ~ %s]",
+                _RESULT_LIMIT, start_date or "*", end_date or "*",
+            )
 
         logger.info("Phase A complete — %d cases queued", len(all_items))
 
@@ -819,13 +836,16 @@ def search_and_crawl(
     except WebDriverException as exc:
         logger.error("WebDriver error (outer): %s", exc, exc_info=True)
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        # 由呼叫端傳入的 driver 交還呼叫端管理（供跨區間重複使用），不在此關閉
+        if own_driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
-    logger.info("Crawl complete — collected %d / %d", collected, max_results)
-    return collected
+    logger.info("Crawl complete — collected %d / %d (total=%s, truncated=%s)",
+                collected, max_results, total, truncated)
+    return {"collected": collected, "total": total, "truncated": truncated}
 
 
 # ─── 重新爬取 stub 紀錄 ───────────────────────────────────────────────────────
@@ -898,8 +918,14 @@ if __name__ == "__main__":
     ap.add_argument("keyword", nargs="?", default="",      help="搜尋關鍵字")
     ap.add_argument("-n", "--num",   type=int, default=10, help="爬取筆數 (預設: 10)")
     ap.add_argument("--no-headless", action="store_true",  help="顯示瀏覽器視窗 (debug 用)")
-    ap.add_argument("--start-date", default="",            help="裁判日期起 YYYY/MM/DD")
-    ap.add_argument("--end-date",   default="",            help="裁判日期迄 YYYY/MM/DD")
+    ap.add_argument("--start-date", default="",
+                    help="裁判日期起 YYYY/MM/DD（西元，伺服器端精確篩選）")
+    ap.add_argument("--end-date",   default="",
+                    help="裁判日期迄 YYYY/MM/DD（西元，伺服器端精確篩選）")
+    ap.add_argument("--case-year-start", type=int, default=None,
+                    help="案號年度起（民國年，如 113）；與裁判日期是不同維度，於本地過濾")
+    ap.add_argument("--case-year-end",   type=int, default=None,
+                    help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，於本地過濾")
     ap.add_argument("--recrawl-stubs", action="store_true",
                     help="重新爬取資料庫中所有 stub/不完整 HTML（不需關鍵字）")
     args = ap.parse_args()
@@ -908,13 +934,20 @@ if __name__ == "__main__":
         n = recrawl_stubs(headless=not args.no_headless)
         print(f"\n完成！共重新爬取 {n} 筆 stub 裁判書。")
     elif args.keyword:
-        n = search_and_crawl(
+        res = search_and_crawl(
             keyword=args.keyword,
             max_results=args.num,
             headless=not args.no_headless,
             start_date=args.start_date,
             end_date=args.end_date,
+            case_year_start=args.case_year_start,
+            case_year_end=args.case_year_end,
         )
-        print(f"\n完成！共爬取 {n} 筆裁判書。")
+        print("")
+        print(f"完成！共爬取 {res['collected']} 筆裁判書"
+              f"（該區間總筆數 {res['total']}）。")
+        if res["truncated"]:
+            print(f"  ⚠ 結果集達單一查詢上限 {_RESULT_LIMIT} 筆，較舊的資料未取得。")
+            print("    請改用 crawl_batched.py，它會自動細分日期區間直到每段低於上限。")
     else:
         ap.print_help()
