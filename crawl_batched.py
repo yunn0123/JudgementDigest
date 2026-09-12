@@ -33,7 +33,8 @@ from datetime import date, timedelta
 from typing import List, Optional, Tuple
 
 from crawler import (
-    search_and_crawl, build_driver, DB_PATH, init_db, _RESULT_LIMIT,
+    search_and_crawl, build_driver, DB_PATH, init_db, Pacer, _RESULT_LIMIT,
+    _DEFAULT_DELAY, _JUDGMENT_TYPES,
 )
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -52,14 +53,38 @@ MAX_PER_CALL = _RESULT_LIMIT
 
 
 # ─── 工具函式 ─────────────────────────────────────────────────────────────────
-def _db_count(keyword: str) -> int:
+def _db_count(label: str) -> int:
+    """本批資料在 DB 的現有筆數。label 即寫入 keyword 欄的標記（見 build_label）。"""
     conn = sqlite3.connect(DB_PATH)
     n = conn.execute(
         "SELECT COUNT(*) FROM crawl_records WHERE keyword LIKE ?",
-        (f"%{keyword}%",),
+        (f"%{label}%",),
     ).fetchone()[0]
     conn.close()
     return n
+
+
+# 完全未指定任何條件時的標籤。匯出端看到它就代表「不要篩選」。
+LABEL_ALL = "全部"
+
+
+def build_label(
+    keyword:       str,
+    court:         str = "",
+    case_types:    Tuple[str, ...] = (),
+    judgment_type: str = "",
+) -> str:
+    """
+    這批資料在 DB keyword 欄的標記。
+
+    有關鍵字時沿用關鍵字（維持既有行為）；無關鍵字（僅法院／類別查詢）時，
+    以條件組出標籤（例：「臺灣臺北地方法院-民事-判決」），
+    否則 keyword 欄會是空字串，進度統計與 export_excel -k 都會失準。
+    """
+    if keyword:
+        return keyword
+    parts = [p for p in (court, *case_types, judgment_type) if p]
+    return "-".join(parts) if parts else LABEL_ALL
 
 
 def _fmt(d: date) -> str:
@@ -96,6 +121,10 @@ def batched_crawl(
     headless: bool,
     case_year_start: Optional[int] = None,
     case_year_end:   Optional[int] = None,
+    court:         str = "",
+    case_types:    Tuple[str, ...] = (),
+    judgment_type: str = "",
+    delay:         float = _DEFAULT_DELAY,
 ) -> int:
     """
     依裁判日期遞迴細分爬取，嚴格由新到舊。
@@ -107,8 +136,17 @@ def batched_crawl(
     原樣傳給 search_and_crawl 由伺服器端年度分群處理。
     注意：切分決策看的是「未經案號年度過濾」的 total，
     因此即使過濾後筆數不多，原區間仍可能被切開 —— 多切幾次而已，正確性不受影響。
+
+    court / case_types 是伺服器端查詢條件，會壓低每段的 total，切分次數因而變少。
+    judgment_type（判決／裁定）則是清單頁過濾，不影響 total，也不影響切分決策。
+
+    delay 為請求基礎間隔（秒）。整個批次共用同一個 Pacer —— 降速狀態必須跨區段延續，
+    否則每段都從全速重新開始，被擋之後會反覆踩同一個坑。
     """
     init_db()
+    label = build_label(keyword, court, case_types, judgment_type)
+    if total_target <= 0:
+        total_target = 10 ** 9      # 0 或負數 = 不設上限，把日期範圍內全部爬完
 
     # 堆疊頂端 = 下一個要處理的段落。初始種子為年度對齊段落，
     # 最舊的年先推入，最新的年最後推入（故最先處理）。
@@ -116,14 +154,19 @@ def batched_crawl(
     total_new = 0
     processed = 0
     truncated_days: List[date] = []
+    # 清單頁錯誤且復原失敗的區段 —— 這些區段沒有翻完，資料不完整，需要重跑
+    failed_segments: List[Tuple[date, date, int]] = []
 
     logger.info(
-        "開始批次爬取：keyword=%r  target=%d  初始段數=%d  range=[%s → %s]  單段上限=%d",
-        keyword, total_target, len(stack), _fmt(start_date), _fmt(end_date), MAX_PER_CALL,
+        "開始批次爬取：keyword=%r  label=%r  court=%s  sys=%s  type=%s  "
+        "target=%d  初始段數=%d  range=[%s → %s]  單段上限=%d",
+        keyword, label, court or "*", "/".join(case_types) or "*", judgment_type or "*",
+        total_target, len(stack), _fmt(start_date), _fmt(end_date), MAX_PER_CALL,
     )
 
-    # 整個批次共用一個 WebDriver，避免每段重建（每次重建約 10 秒）
+    # 整個批次共用一個 WebDriver 與一個 Pacer（降速狀態要跨區段延續）
     driver = build_driver(headless)
+    pacer  = Pacer(delay=delay)
     try:
         while stack and total_new < total_target:
             cs, ce = stack.pop()
@@ -136,7 +179,7 @@ def batched_crawl(
                 processed, _fmt(cs), _fmt(ce), span_days, len(stack), total_new, total_target,
             )
 
-            before = _db_count(keyword)
+            before = _db_count(label)
             # 只取到還差的筆數為止，避免最後一段大幅超收
             remaining = min(MAX_PER_CALL, total_target - total_new)
             res = search_and_crawl(
@@ -148,10 +191,26 @@ def batched_crawl(
                 driver=driver,
                 case_year_start=case_year_start,
                 case_year_end=case_year_end,
+                court=court,
+                case_types=tuple(case_types),
+                judgment_type=judgment_type,
+                keyword_label=label,
+                pacer=pacer,
                 # 單日已無法再細分 → 不再探測，直接把能拿的拿走
                 skip_if_truncated=not single_day,
             )
-            new = _db_count(keyword) - before
+            # Phase B 每 80 筆會重建 WebDriver session，舊的已被 quit
+            # → 必須換用回傳的 driver，否則下一段會用到失效的 session
+            driver = res.get("driver") or driver
+            new = _db_count(label) - before
+
+            errs = int(res.get("page_errors", 0) or 0)
+            if errs:
+                failed_segments.append((cs, ce, errs))
+                logger.error(
+                    "  ✗ %s → %s 有 %d 次清單頁錯誤無法復原 —— 此區段資料不完整",
+                    _fmt(cs), _fmt(ce), errs,
+                )
             total_new += new
 
             if res["truncated"] and not single_day:
@@ -170,8 +229,9 @@ def batched_crawl(
                 truncated_days.append(cs)
                 logger.warning(
                     "  ⚠ %s 單日即有 %s 筆（>= %d），日期已無法再細分 → "
-                    "已改用法院分群逐桶收集，取得 %d 筆",
-                    _fmt(cs), res["total"], _RESULT_LIMIT, res["collected"],
+                    "已改用%s逐桶收集，取得 %d 筆",
+                    _fmt(cs), res["total"], _RESULT_LIMIT,
+                    "案號年度分群" if court else "法院分群", res["collected"],
                 )
 
             logger.info(
@@ -186,12 +246,20 @@ def batched_crawl(
 
     logger.info("=" * 60)
     logger.info("批次爬取完成。處理段數=%d  總新增=%d 筆", processed, total_new)
+    logger.info("請求節奏：%s", pacer.summary())
     logger.info("=" * 60)
     if truncated_days:
         logger.warning(
             "以下 %d 個單日超過 %d 筆上限，資料可能不完整：%s",
             len(truncated_days), _RESULT_LIMIT,
             ", ".join(_fmt(d) for d in truncated_days[:10]),
+        )
+    if failed_segments:
+        logger.error(
+            "以下 %d 個區段因清單頁錯誤未翻完，請以相同條件重跑這些日期：\n%s",
+            len(failed_segments),
+            "\n".join(f"  --start-date {_fmt(a)} --end-date {_fmt(b)}（{n} 次錯誤）"
+                      for a, b, n in failed_segments),
         )
     return total_new
 
@@ -206,12 +274,15 @@ if __name__ == "__main__":
   python crawl_batched.py 借名登記 -n 2000
   python crawl_batched.py 借名登記 -n 1000 --start-year 2018 --end-year 2023
   python crawl_batched.py 借名登記 -n 500  --start-date 2024/01/01 --end-date 2025/04/28
+  python crawl_batched.py -n 0 --court 臺灣臺北地方法院 --case-type 民事 \\
+                          --judgment-type 判決 --start-date 2025/01/01 --end-date 2025/12/31
         """,
     )
-    ap.add_argument("keyword", help="搜尋關鍵字")
+    ap.add_argument("keyword", nargs="?", default="",
+                    help="搜尋關鍵字（指定 --court／--case-type 時可省略）")
     ap.add_argument(
         "-n", "--num", type=int, default=1000,
-        help="目標筆數（預設: 1000）",
+        help="目標筆數（預設: 1000；0 = 不設上限，把範圍內全部爬完）",
     )
     ap.add_argument(
         "--start-year", type=int, default=2015,
@@ -238,10 +309,31 @@ if __name__ == "__main__":
         help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，伺服器端分群",
     )
     ap.add_argument(
+        "--court", default="",
+        help="裁判法院（名稱或代碼，如「臺灣臺北地方法院」或 TPD），伺服器端篩選",
+    )
+    ap.add_argument(
+        "--case-type", default="",
+        help="案件類別，逗號分隔（憲法/民事/刑事/行政/懲戒），伺服器端篩選",
+    )
+    ap.add_argument(
+        "--judgment-type", default="", choices=("", *_JUDGMENT_TYPES),
+        help="裁判種類（判決／裁定）；於結果清單頁過濾，下載前就濾掉",
+    )
+    ap.add_argument(
+        "--delay", type=float, default=_DEFAULT_DELAY,
+        help="請求基礎間隔秒數（預設: 1.0）。遇錯自動加倍降速、連續失敗長暫停；"
+             "長時間爬取建議 1.5~2",
+    )
+    ap.add_argument(
         "--no-headless", action="store_true",
         help="顯示瀏覽器視窗（debug 用）",
     )
     args = ap.parse_args()
+
+    case_types = tuple(t.strip() for t in args.case_type.split(",") if t.strip())
+    if not args.keyword and not args.court and not case_types:
+        ap.error("請至少指定 關鍵字、--court 或 --case-type 其中之一")
 
     today = date.today()
 
@@ -266,5 +358,9 @@ if __name__ == "__main__":
         headless=not args.no_headless,
         case_year_start=args.case_year_start,
         case_year_end=args.case_year_end,
+        court=args.court,
+        case_types=case_types,
+        judgment_type=args.judgment_type,
+        delay=args.delay,
     )
     print(f"\n完成！共新增 {total} 筆裁判書至資料庫。")

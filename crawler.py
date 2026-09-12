@@ -3,18 +3,22 @@ Part 1 — 司法院裁判書自動爬蟲
 目標網站: https://judgment.judicial.gov.tw/FJUD/default.aspx
 
 使用方式:
-    python crawler.py <關鍵字> [-n 筆數] [--no-headless]
+    python crawler.py [關鍵字] [-n 筆數] [--no-headless]
                       [--start-date YYYY/MM/DD] [--end-date YYYY/MM/DD]
                       [--case-year-start 民國年] [--case-year-end 民國年]
+                      [--court 法院] [--case-type 民事] [--judgment-type 判決]
 
 範例:
     python crawler.py 詐欺 -n 20
     python crawler.py 勞動契約 -n 10 --start-date 2023/01/01 --end-date 2023/12/31 --no-headless
+    python crawler.py -n 50 --court 臺灣臺北地方法院 --case-type 民事 --judgment-type 判決 \
+                      --start-date 2025/01/01 --end-date 2025/01/07
 """
 
 import sqlite3
 import time
 import os
+import random
 import re
 import argparse
 import logging
@@ -116,6 +120,98 @@ def build_driver(headless: bool = True) -> webdriver.Chrome:
     ]})
 
     return driver
+
+
+# ─── 速率控制 ─────────────────────────────────────────────────────────────────
+# 全年爬取會送出上萬次請求、連續數小時。固定間隔沒有回饋迴路 —— 伺服器開始拒絕時
+# 仍以原速持續敲，只會把情況推得更糟（實測：密集查詢會讓結果集 q= hash 被作廢，
+# 清單頁全部變成「查詢設定錯誤」）。Pacer 讓節奏能隨伺服器反應調整：
+#   正常   → 基礎間隔 × 隨機抖動（避免固定節奏，也避免與伺服器清理週期共振）
+#   出錯   → 全域倍率加倍（上限 8 倍），後續每個請求都跟著放慢
+#   連續錯 → 直接長暫停，讓對方喘口氣，而不是硬打
+#   恢復   → 連續成功一段時間後倍率減半，逐步回到正常速度
+_DEFAULT_DELAY   = 1.0      # 詳細頁基礎間隔（秒）；清單頁與查詢依比例換算
+_LIST_DELAY_RATIO = 0.6     # 清單頁翻頁較輕量，用 0.6 倍
+_JITTER          = 0.3      # 間隔的隨機抖動幅度（±30%）
+_MAX_SLOWDOWN    = 8.0      # 全域降速倍率上限
+_RECOVER_STREAK  = 10       # 連續成功幾次後嘗試恢復速度
+_BRAKE_THRESHOLD = 5        # 連續失敗幾次觸發長暫停
+_BRAKE_PAUSE     = 300.0    # 長暫停秒數
+
+
+class Pacer:
+    """
+    請求節奏控制器。單執行緒使用，跨區段共用同一個實例即可讓降速狀態延續。
+
+    kind: "detail"（裁判書詳細頁）/ "list"（清單翻頁）/ "query"（送出查詢）
+    """
+
+    def __init__(
+        self,
+        delay:           float = _DEFAULT_DELAY,
+        jitter:          float = _JITTER,
+        brake_threshold: int   = _BRAKE_THRESHOLD,
+        brake_pause:     float = _BRAKE_PAUSE,
+    ):
+        self.delay           = max(0.0, delay)
+        self.jitter          = jitter
+        self.brake_threshold = brake_threshold
+        self.brake_pause     = brake_pause
+        self.multiplier      = 1.0
+        self.requests        = 0
+        self.slowdowns       = 0
+        self.brakes          = 0
+        self.started         = time.time()
+        self._ok_streak      = 0
+        self._fail_streak    = 0
+
+    def _base(self, kind: str) -> float:
+        return self.delay * (_LIST_DELAY_RATIO if kind == "list" else 1.0)
+
+    def wait(self, kind: str = "detail") -> float:
+        """送出下一個請求前的等待。回傳實際等待秒數（方便測試與記錄）。"""
+        base = self._base(kind) * self.multiplier
+        secs = base * random.uniform(1.0 - self.jitter, 1.0 + self.jitter) if base else 0.0
+        if secs:
+            time.sleep(secs)
+        self.requests += 1
+        return secs
+
+    def on_success(self) -> None:
+        """請求成功。連續成功夠多次就把降速倍率收斂回來。"""
+        self._fail_streak = 0
+        self._ok_streak  += 1
+        if self.multiplier > 1.0 and self._ok_streak >= _RECOVER_STREAK:
+            self.multiplier = max(1.0, self.multiplier / 2.0)
+            self._ok_streak = 0
+            logger.info("速率恢復：間隔倍率 → x%.1f", self.multiplier)
+
+    def on_failure(self, reason: str = "") -> None:
+        """
+        請求失敗（錯誤頁、逾時、WebDriver 異常）。
+        立即全域降速；連續失敗達門檻則長暫停 —— 此時繼續敲只會延長被拒的時間。
+        """
+        self._ok_streak = 0
+        self._fail_streak += 1
+        if self.multiplier < _MAX_SLOWDOWN:
+            self.multiplier = min(_MAX_SLOWDOWN, self.multiplier * 2.0)
+            self.slowdowns += 1
+            logger.warning("偵測到失敗（%s）→ 降速，間隔倍率 x%.1f", reason or "?", self.multiplier)
+        if self._fail_streak >= self.brake_threshold:
+            self.brakes += 1
+            logger.error(
+                "連續 %d 次失敗 → 暫停 %.0f 秒讓伺服器恢復（第 %d 次）",
+                self._fail_streak, self.brake_pause, self.brakes,
+            )
+            time.sleep(self.brake_pause)
+            self._fail_streak = 0
+
+    def summary(self) -> str:
+        elapsed = max(1e-9, time.time() - self.started)
+        rpm = self.requests / (elapsed / 60.0)
+        return (f"請求 {self.requests} 次 / {elapsed / 60.0:.1f} 分鐘 = {rpm:.1f} 次/分；"
+                f"降速 {self.slowdowns} 次、長暫停 {self.brakes} 次、"
+                f"目前倍率 x{self.multiplier:.1f}")
 
 
 # ─── HTML 完整性檢查 ──────────────────────────────────────────────────────────
@@ -427,6 +523,94 @@ def _judgment_date(url: str) -> str:
 _RESULT_LIMIT = 500          # 單一結果集可翻取的硬性上限
 _AD_DATE_FIELDS = ("dy1", "dm1", "dd1", "dy2", "dm2", "dd2")
 
+# 進階搜尋的「裁判法院」（jud_court 複選清單）選項值。
+# 法院與案件類別都寫進查詢本身，因此各自產生獨立的 q= hash、獨立的 500 額度。
+_COURT_CODES = {
+    "憲法法庭":                   "JCC",
+    "司法院刑事補償法庭":         "TPC",
+    "司法院－訴願決定":           "TPU",
+    "最高法院":                   "TPS",
+    "最高行政法院":               "TPA",
+    "懲戒法院－懲戒法庭":         "TPP",
+    "懲戒法院－職務法庭":         "TPJ",
+    "臺灣高等法院":               "TPH",
+    "臺灣高等法院－訴願決定":     "001",
+    "臺北高等行政法院 高等庭":    "TPB",
+    "臺北高等行政法院 地方庭":    "TPT",
+    "臺中高等行政法院 高等庭":    "TCB",
+    "臺中高等行政法院 地方庭":    "TCT",
+    "高雄高等行政法院 高等庭":    "KSB",
+    "高雄高等行政法院 地方庭":    "KST",
+    "智慧財產及商業法院":         "IPC",
+    "臺灣高等法院 臺中分院":      "TCH",
+    "臺灣高等法院 臺南分院":      "TNH",
+    "臺灣高等法院 高雄分院":      "KSH",
+    "臺灣高等法院 花蓮分院":      "HLH",
+    "臺灣臺北地方法院":           "TPD",
+    "臺灣士林地方法院":           "SLD",
+    "臺灣新北地方法院":           "PCD",
+    "臺灣宜蘭地方法院":           "ILD",
+    "臺灣基隆地方法院":           "KLD",
+    "臺灣桃園地方法院":           "TYD",
+    "臺灣新竹地方法院":           "SCD",
+    "臺灣苗栗地方法院":           "MLD",
+    "臺灣臺中地方法院":           "TCD",
+    "臺灣彰化地方法院":           "CHD",
+    "臺灣南投地方法院":           "NTD",
+    "臺灣雲林地方法院":           "ULD",
+    "臺灣嘉義地方法院":           "CYD",
+    "臺灣臺南地方法院":           "TND",
+    "臺灣高雄地方法院":           "KSD",
+    "臺灣橋頭地方法院":           "CTD",
+    "臺灣花蓮地方法院":           "HLD",
+    "臺灣臺東地方法院":           "TTD",
+    "臺灣屏東地方法院":           "PTD",
+    "臺灣澎湖地方法院":           "PHD",
+    "福建高等法院金門分院":       "KMH",
+    "福建金門地方法院":           "KMD",
+    "福建連江地方法院":           "LCD",
+    "臺灣高雄少年及家事法院":     "KSY",
+}
+
+# 進階搜尋的「案件類別」（jud_sys checkbox）值。未勾選 = 全選。
+_CASE_SYS_CODES = {
+    "憲法": "C", "民事": "V", "刑事": "M", "行政": "A", "懲戒": "P",
+}
+
+# 裁判種類只能在結果清單頁過濾 —— 進階搜尋沒有「判決／裁定」欄位。
+# 清單上的裁判字號尾端固定寫明種類（例：「…第 1 號民事判決」），據此過濾即可，
+# 且過濾發生在下載之前，可省下大量不需要的詳細頁請求。
+_JUDGMENT_TYPES = ("判決", "裁定")
+
+
+def _court_code(name: str) -> str:
+    """法院名稱或代碼 → jud_court 選項值；無法辨識回傳空字串。"""
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    if raw.upper() in set(_COURT_CODES.values()):
+        return raw.upper()
+    norm = raw.replace("台", "臺")
+    if norm in _COURT_CODES:
+        return _COURT_CODES[norm]
+    # 允許簡寫（例如「臺北地方法院」「臺北地院」）—— 僅在唯一命中時接受
+    cand = [c for n, c in _COURT_CODES.items() if norm in n]
+    if len(cand) == 1:
+        return cand[0]
+    if not cand and norm.endswith("地院"):
+        return _court_code(norm[:-2] + "地方法院")
+    return ""
+
+
+def _sys_code(name: str) -> str:
+    """案件類別名稱或代碼 → jud_sys checkbox 值；無法辨識回傳空字串。"""
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    if raw.upper() in set(_CASE_SYS_CODES.values()):
+        return raw.upper()
+    return _CASE_SYS_CODES.get(raw, "")
+
 
 def _roc_parts(date_str: str) -> Optional[Tuple[int, int, int]]:
     """西元 YYYY/MM/DD（或 YYYY-MM-DD）→ (民國年, 月, 日)。"""
@@ -478,20 +662,51 @@ def _ad_search(
     keyword:    str,
     start_date: str = "",
     end_date:   str = "",
+    court:      str = "",
+    case_types: Tuple[str, ...] = (),
 ) -> Tuple[Optional[str], Optional[int]]:
     """
-    在進階搜尋頁送出「關鍵字 + 裁判日期區間」查詢。
+    在進階搜尋頁送出「關鍵字 + 裁判日期區間 + 裁判法院 + 案件類別」查詢。
     日期以民國年月日分別填入 dy1/dm1/dd1（起）與 dy2/dm2/dd2（迄）。
+    法院與案件類別同樣是查詢條件（非結果頁分群），故各條件組合都有自己的 500 額度。
     回傳 (結果列表 URL, 總筆數)；查詢失敗回傳 (None, None)。
     """
     driver.get(BASE_URL_AD)
     time.sleep(2.5)
     _dismiss_alert(driver)
 
+    # 重新載入查詢頁時，瀏覽器會還原上一次填過的表單內容（同一個 driver 會跨多次
+    # 查詢重複使用）。因此每個欄位都必須明確設定 —— 未指定的條件要主動清掉，
+    # 否則上一段的關鍵字／法院／類別會悄悄留下來，讓這一段查到錯誤的結果集。
+    kw = driver.find_element(By.ID, "jud_kw")
+    kw.clear()
     if keyword:
-        kw = driver.find_element(By.ID, "jud_kw")
-        kw.clear()
         kw.send_keys(keyword)
+
+    sel = Select(driver.find_element(By.ID, "jud_court"))
+    sel.deselect_all()                  # 含預設選取的「所有法院」空值選項
+    if court:
+        code = _court_code(court)
+        if code:
+            sel.select_by_value(code)
+        else:
+            logger.warning("Unknown court %r — ignored (查詢將涵蓋所有法院)", court)
+
+    wanted_sys = set()
+    for ct in case_types:
+        code = _sys_code(ct)
+        if code:
+            wanted_sys.add(code)
+        else:
+            logger.warning("Unknown case type %r — ignored", ct)
+    for el in driver.find_elements(By.CSS_SELECTOR, "input[name='jud_sys']"):
+        if el.is_selected() != (el.get_attribute("value") in wanted_sys):
+            # JS click：checkbox 被 label 覆蓋時原生 click 會被攔截
+            driver.execute_script("arguments[0].click();", el)
+
+    if court or wanted_sys:
+        # 勾選法院／案件類別會觸發「常用字別」的 AJAX，稍候再送出以免競態
+        time.sleep(1.0)
 
     values = {}
     for label, ds in (("1", start_date), ("2", end_date)):
@@ -504,9 +719,9 @@ def _ad_search(
         values[f"dy{label}"], values[f"dm{label}"], values[f"dd{label}"] = parts
 
     for fid in _AD_DATE_FIELDS:
+        el = driver.find_element(By.ID, fid)
+        el.clear()                      # 未指定日期時也要清掉殘留值
         if fid in values:
-            el = driver.find_element(By.ID, fid)
-            el.clear()
             el.send_keys(str(values[fid]))
 
     driver.find_element(By.ID, "btnQry").click()
@@ -519,8 +734,9 @@ def _ad_search(
 
     total = _result_total(driver)
     url   = _get_results_list_url(driver)
-    logger.info("AD search [%s ~ %s] → total=%s",
-                start_date or "*", end_date or "*", total)
+    logger.info("AD search [%s ~ %s] court=%s sys=%s → total=%s",
+                start_date or "*", end_date or "*",
+                court or "*", "/".join(case_types) or "*", total)
     return url, total
 
 
@@ -540,9 +756,57 @@ _COURT_RE = re.compile(
     r'(?:\s+\S+分院|\s+地方庭)?)'
 )
 
+# ─── 清單頁錯誤偵測 ───────────────────────────────────────────────────────────
+# 伺服器端的查詢結果集（q= hash）會失效：翻頁翻到一半、或短時間內查詢過於密集時，
+# 清單頁會變成「查詢設定錯誤，請重新設定查詢條件後查詢」的系統訊息頁。
+# 這種頁面「沒有案件連結」，若當成「已翻完」就會靜靜少收一批資料 —— 必須和
+# 「真的查無資料」分開處理：前者要重送查詢並回到原頁，後者才是結束。
+_LIST_ERROR_MARKERS = (
+    "查詢設定錯誤",          # q hash 失效／查詢條件遺失
+    "請重新設定查詢條件",
+    "Request Rejected",      # 前端 bot-defense
+)
+
+
+def _list_page_error(driver: webdriver.Chrome) -> str:
+    """目前頁面若是錯誤頁，回傳命中的特徵字串；正常頁（含真的查無資料）回傳空字串。"""
+    try:
+        html = driver.page_source or ""
+    except WebDriverException:
+        return "WebDriver error"
+    for marker in _LIST_ERROR_MARKERS:
+        if marker in html:
+            return marker
+    return ""
+
+
+def _page_url(base_url: str, page: int) -> str:
+    """
+    組出清單頁第 N 頁的網址。
+
+    清單頁本身的「下一頁」連結即為 qryresultlst.aspx?q=<hash>&sort=DS&page=N&ot=in，
+    因此頁碼可直接定址 —— 復原時才能跳回中斷的那一頁，而不必從第 1 頁重來。
+    分群桶網址（&gy=jyear&gc=114 等）同樣適用。
+    """
+    base = re.sub(r"[?&](?:sort|page|ot)=[^&]*", "", base_url)
+    sep  = "&" if "?" in base else "?"
+    return f"{base}{sep}sort=DS&page={page}&ot=in"
+
+
+def _carry_group_params(old_url: str, new_url: str) -> str:
+    """把舊清單網址的分群參數（gy/gc）接到重新查詢取得的新網址上。"""
+    parts = re.findall(r"[?&]((?:gy|gc)=[^&]*)", old_url)
+    return new_url + ("&" + "&".join(parts) if parts else "")
+
+
 def _parse_case_rows(driver: webdriver.Chrome) -> List[Dict]:
     """從 qryresultlst.aspx 擷取個別案件的連結與基本資訊。"""
     rows: List[Dict] = []
+    err = _list_page_error(driver)
+    if err:
+        # 錯誤頁不會有案件連結，直接返回，省下 25 秒的等待
+        logger.warning("Results list page is an error page (%s)", err)
+        return rows
     try:
         WebDriverWait(driver, 25).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, _CASE_LINK_CSS))
@@ -662,11 +926,16 @@ def search_and_crawl(
     end_date:    str  = "",
     case_year_start: Optional[int] = None,
     case_year_end:   Optional[int] = None,
+    court:         str = "",
+    case_types:    Tuple[str, ...] = (),
+    judgment_type: str = "",
+    keyword_label: str = "",
     driver:      Optional[webdriver.Chrome] = None,
+    pacer:       Optional["Pacer"] = None,
     skip_if_truncated: bool = False,
 ) -> Dict[str, object]:
     """
-    以「關鍵字 + 裁判日期區間」搜尋並爬取裁判書。
+    以「關鍵字 + 裁判日期區間 + 法院 + 案件類別」搜尋並爬取裁判書。
 
     流程：
       1. default_AD.aspx 進階搜尋：關鍵字 + 裁判日期起迄 → 取得該區間專屬的 q= hash
@@ -681,10 +950,27 @@ def search_and_crawl(
                                   並保留本地過濾切精確邊界（統括桶需要）。
                                   註：進階搜尋的 jud_year 須與字別、案號同時給定，
                                   無法單獨當範圍條件，故走分群而非表單欄位。
+      court                       裁判法院（名稱或代碼，如「臺灣臺北地方法院」/`TPD`），
+                                  伺服器端查詢條件
+      case_types                  案件類別（如 ("民事",)），伺服器端查詢條件；
+                                  空 tuple = 全部類別
+      judgment_type               裁判種類（「判決」或「裁定」）。進階搜尋沒有此欄位，
+                                  於結果清單頁依裁判字號過濾 —— 在下載前就濾掉，
+                                  可大幅減少詳細頁請求數
+      keyword_label               寫入 DB keyword 欄的標籤。未指定時沿用 keyword；
+                                  無關鍵字查詢（僅法院／類別）時用它標記這批資料，
+                                  供 export_excel 的 -k 篩選
       driver                      傳入既有 driver 可跨多次呼叫重複使用（不會被關閉）
+      pacer                       請求節奏控制（見 Pacer）。跨區段傳入同一個實例，
+                                  降速狀態才能延續 —— 否則每段都從全速重新開始，
+                                  一被擋就會反覆踩同一個坑
       skip_if_truncated           True 時，一旦偵測到結果被截斷就立即返回不翻頁
 
-    回傳 {"collected": 實際下載數, "total": 該區間總筆數, "truncated": 是否被截斷}
+    回傳 {"collected": 實際下載數, "total": 該區間總筆數, "truncated": 是否被截斷,
+          "page_errors": 清單頁錯誤且復原失敗的次數, "driver": 目前有效的 WebDriver}
+    page_errors > 0 代表該區段的清單沒有翻完，資料不完整，呼叫端應重跑該區段。
+    注意 driver：Phase B 每 80 筆會重建 session（舊的會被 quit），
+    因此傳入自己的 driver 時，下一次呼叫務必改用回傳的這一個。
     """
     os.makedirs(HTML_DIR, exist_ok=True)
     init_db()
@@ -692,7 +978,10 @@ def search_and_crawl(
     own_driver = driver is None
     if own_driver:
         driver = build_driver(headless)
+    if pacer is None:
+        pacer = Pacer()
     collected = 0
+    page_errors = 0       # 清單頁出現錯誤頁且無法復原的次數（> 0 代表該區段可能不完整）
     total: Optional[int] = None
     truncated = False
     court_links: List[Tuple[str, str]] = []
@@ -700,10 +989,13 @@ def search_and_crawl(
 
     try:
         # ── 1. 進階搜尋取得該日期區間專屬的結果集 ─────────────────────
-        base_results_url, total = _ad_search(driver, keyword, start_date, end_date)
+        pacer.wait("query")
+        base_results_url, total = _ad_search(
+            driver, keyword, start_date, end_date, court, tuple(case_types))
         if not base_results_url:
             logger.error("Advanced search returned no results URL — aborting")
-            return {"collected": 0, "total": total, "truncated": False}
+            return {"collected": 0, "total": total, "truncated": False,
+                    "page_errors": page_errors, "driver": driver}
 
         # ── 2. 判斷是否觸及單一結果集上限 ─────────────────────────────
         # 結果按裁判日期由新到舊排序，截斷時被砍掉的是最舊的部分。
@@ -715,16 +1007,24 @@ def search_and_crawl(
             )
             if skip_if_truncated:
                 logger.info("skip_if_truncated — returning for caller to split")
-                return {"collected": 0, "total": total, "truncated": True}
+                return {"collected": 0, "total": total, "truncated": True,
+                        "page_errors": page_errors, "driver": driver}
 
             # 呼叫端表示已無法再切分日期（例如區間已縮到單日），
-            # 最後手段：改用法院分群把同一個日期區間再切細。
-            # gy=jcourt 與日期條件不衝突 —— 日期在查詢裡，法院是該結果集的分群，
-            # 每個法院桶各自獨立計算 500 額度。
+            # 最後手段：改用結果頁分群把同一個日期區間再切細。
+            # 分群與日期條件不衝突 —— 日期在查詢裡，分群是該結果集的切面，
+            # 每個桶各自獨立計算 500 額度。
             # 必須在離開摘要頁前收集，導覽到 qryresultlst.aspx 後就看不到這些連結。
-            court_links = _collect_court_links(driver)
-            if court_links:
-                logger.info("Fallback: subdividing by court (%d courts)", len(court_links))
+            if court:
+                # 法院已是查詢條件 → 法院分群只會有一桶，改用案號年度軸細分
+                year_links = _collect_year_links(driver)
+                if year_links:
+                    logger.info("Fallback: subdividing by case-number year (%d buckets)",
+                                len(year_links))
+            else:
+                court_links = _collect_court_links(driver)
+                if court_links:
+                    logger.info("Fallback: subdividing by court (%d courts)", len(court_links))
 
         # 指定案號年度時，改用伺服器端的年度分群（?gy=jyear&gc=<年>），
         # 只取回符合的年度而非整個日期區間，可省下大量無用翻頁。
@@ -761,24 +1061,76 @@ def search_and_crawl(
                 or lo <= _case_number_year(it.get("url", "")) <= hi
             ]
 
-        def _paginate(label: str) -> None:
+        def _filter_by_judgment_type(items: List[Dict]) -> List[Dict]:
+            """裁判種類過濾（清單頁的裁判字號尾端就寫明「…民事判決」／「…民事裁定」）。"""
+            if not judgment_type:
+                return items
+            return [it for it in items if judgment_type in (it.get("case_number") or "")]
+
+        def _recover_list_page(base_url: str, page: int, marker: str, label: str) -> bool:
+            """
+            清單頁變成錯誤頁時的復原程序：
+              1. 稍候重載同一頁（多半是暫時性的）
+              2. 仍失敗 → 重新送出同一組查詢條件取得新的 q hash，再跳回同一頁
+            成功回傳 True（呼叫端可直接重新解析目前頁面）。
+            """
+            if not base_url:
+                return False
+            logger.warning("清單頁異常（%s）%s page=%d — 嘗試復原", marker, label or "", page)
+            pacer.on_failure(marker)          # 全域降速：這是伺服器在抗議
+            for wait in (3, 10, 30):
+                time.sleep(wait)
+                driver.get(_page_url(base_url, page))
+                time.sleep(1.5)
+                if not _list_page_error(driver):
+                    logger.info("  ↳ 重載成功，自 page=%d 續翻", page)
+                    pacer.on_success()
+                    return True
+
+            # q hash 已失效 → 重送查詢。分群參數（gy/gc）沿用舊網址的設定。
+            new_url, _new_total = _ad_search(
+                driver, keyword, start_date, end_date, court, tuple(case_types))
+            if not new_url:
+                return False
+            driver.get(_page_url(_carry_group_params(base_url, new_url), page))
+            time.sleep(1.5)
+            ok = not _list_page_error(driver)
+            logger.info("  ↳ 重新查詢後%s（page=%d）", "復原成功" if ok else "仍失敗", page)
+            return ok
+
+        def _paginate(label: str, base_url: str = "") -> None:
             """從目前頁面一路翻頁收集，直到無下一頁或達 max_results。"""
+            nonlocal page_errors
+            page = 1
             while len(all_items) < max_results:
                 raw_items = _parse_case_rows(driver)
                 if not raw_items:
+                    # 空清單有兩種意義：真的翻完了，或伺服器丟回錯誤頁。
+                    # 後者若當成翻完，這一段就會靜靜地少收資料。
+                    marker = _list_page_error(driver)
+                    if marker:
+                        if _recover_list_page(base_url, page, marker, label):
+                            continue          # 復原成功 → 重新解析同一頁
+                        page_errors += 1
+                        logger.error(
+                            "清單頁無法復原（%s）%s page=%d — 此區段資料不完整",
+                            marker, label or "", page,
+                        )
                     break
-                fresh = [it for it in _filter_by_case_year(raw_items)
+                fresh = [it for it in _filter_by_judgment_type(_filter_by_case_year(raw_items))
                          if it.get("url") and it["url"] not in seen_urls]
                 needed = max_results - len(all_items)
                 for it in fresh[:needed]:
                     seen_urls.add(it["url"])
                     all_items.append(it)
+                pacer.on_success()
                 logger.info("  %d / %d collected%s", len(all_items), max_results, label)
                 if len(all_items) >= max_results:
                     break
                 if not _go_next_page(driver):
                     break
-                time.sleep(0.6)
+                page += 1
+                pacer.wait("list")
 
         if court_links:
             # 最後手段路徑：同一日期區間內再依法院逐桶收集
@@ -788,7 +1140,7 @@ def search_and_crawl(
                 logger.info("  [Court] %s", court_label)
                 driver.get(court_url)
                 time.sleep(2.0)
-                _paginate(f"  [{court_label}]")
+                _paginate(f"  [{court_label}]", court_url)
         elif year_links:
             # 伺服器端案號年度篩選：只翻符合年度的桶（由新到舊）。
             # _paginate 內仍會套用本地過濾 —— 統括桶需要它才能精確切到範圍，
@@ -801,7 +1153,7 @@ def search_and_crawl(
                 driver.get(year_url)
                 time.sleep(2.0)
                 _before = len(all_items)
-                _paginate(f"  [{tag}]")
+                _paginate(f"  [{tag}]", year_url)
                 if len(all_items) - _before >= _RESULT_LIMIT:
                     logger.warning(
                         "  ⚠ 年度桶 %s 取得 %d 筆已達上限，該桶可能仍有遺漏",
@@ -810,12 +1162,13 @@ def search_and_crawl(
         else:
             driver.get(base_results_url)
             time.sleep(2.5)
-            _paginate("")
+            _paginate("", base_results_url)
 
         # 防護：摘要頁的總筆數若讀不到（頁面改版等），改以「恰好收滿上限」反推截斷。
         # 未指定案號年度過濾時，收到剛好 _RESULT_LIMIT 筆幾乎必然代表被截斷。
         if (total is None and not truncated and not court_links
                 and case_year_start is None and case_year_end is None
+                and not judgment_type
                 and len(all_items) >= _RESULT_LIMIT
                 and max_results >= _RESULT_LIMIT):
             truncated = True
@@ -880,24 +1233,28 @@ def search_and_crawl(
             except WebDriverException as exc:
                 logger.warning("WebDriver error on %s: %s — restarting session and retrying",
                                case_number, exc)
+                pacer.on_failure("WebDriver error")
                 driver = _renew_driver()
                 try:
                     html_file = crawl_detail_page(driver, item["url"], case_number)
                     _session_requests += 1
                 except WebDriverException as exc2:
                     logger.error("Retry also failed for %s: %s — skipping", case_number, exc2)
+                    pacer.on_failure("detail page retry failed")
 
             if html_file:
+                pacer.on_success()
                 if existing:
                     _mark_recrawled(case_number, html_file)
                 else:
                     upsert_record(
                         case_number, item["court"], item["case_title"],
-                        item["judgment_date"], item["url"], html_file, keyword
+                        item["judgment_date"], item["url"], html_file,
+                        keyword_label or keyword,
                     )
                 collected += 1
 
-            time.sleep(1.0)
+            pacer.wait("detail")
 
     except WebDriverException as exc:
         logger.error("WebDriver error (outer): %s", exc, exc_info=True)
@@ -909,9 +1266,12 @@ def search_and_crawl(
             except Exception:
                 pass
 
-    logger.info("Crawl complete — collected %d / %d (total=%s, truncated=%s)",
-                collected, max_results, total, truncated)
-    return {"collected": collected, "total": total, "truncated": truncated}
+    logger.info("Crawl complete — collected %d / %d (total=%s, truncated=%s, page_errors=%d)",
+                collected, max_results, total, truncated, page_errors)
+    # driver 一併回傳：Phase B 每 80 筆會重建 session，舊的已被 quit，
+    # 呼叫端必須換用回傳的這個，否則下一段會拿到失效的 session。
+    return {"collected": collected, "total": total, "truncated": truncated,
+            "page_errors": page_errors, "driver": driver}
 
 
 # ─── 重新爬取 stub 紀錄 ───────────────────────────────────────────────────────
@@ -992,14 +1352,26 @@ if __name__ == "__main__":
                     help="案號年度起（民國年，如 113）；與裁判日期是不同維度，伺服器端分群")
     ap.add_argument("--case-year-end",   type=int, default=None,
                     help="案號年度迄（民國年，如 115）；與裁判日期是不同維度，伺服器端分群")
+    ap.add_argument("--court", default="",
+                    help="裁判法院（名稱或代碼，如「臺灣臺北地方法院」或 TPD），伺服器端篩選")
+    ap.add_argument("--case-type", default="",
+                    help="案件類別，逗號分隔（憲法/民事/刑事/行政/懲戒），伺服器端篩選")
+    ap.add_argument("--judgment-type", default="", choices=("", *_JUDGMENT_TYPES),
+                    help="裁判種類（判決／裁定）；於結果清單頁過濾，下載前就濾掉")
+    ap.add_argument("--label", default="",
+                    help="寫入 DB keyword 欄的標籤（無關鍵字查詢時用來標記這批資料）")
+    ap.add_argument("--delay", type=float, default=_DEFAULT_DELAY,
+                    help="請求基礎間隔秒數（預設: 1.0）；遇錯自動降速、連續失敗長暫停")
     ap.add_argument("--recrawl-stubs", action="store_true",
                     help="重新爬取資料庫中所有 stub/不完整 HTML（不需關鍵字）")
     args = ap.parse_args()
 
+    case_types = tuple(t.strip() for t in args.case_type.split(",") if t.strip())
+
     if args.recrawl_stubs:
         n = recrawl_stubs(headless=not args.no_headless)
         print(f"\n完成！共重新爬取 {n} 筆 stub 裁判書。")
-    elif args.keyword:
+    elif args.keyword or args.court or case_types:
         res = search_and_crawl(
             keyword=args.keyword,
             max_results=args.num,
@@ -1008,15 +1380,21 @@ if __name__ == "__main__":
             end_date=args.end_date,
             case_year_start=args.case_year_start,
             case_year_end=args.case_year_end,
+            court=args.court,
+            case_types=case_types,
+            judgment_type=args.judgment_type,
+            keyword_label=args.label,
+            pacer=Pacer(delay=args.delay),
         )
         print("")
         print(f"完成！共爬取 {res['collected']} 筆裁判書"
               f"（該區間總筆數 {res['total']}）。")
         if res["truncated"]:
+            _axis = "案號年度分群" if args.court else "法院分群"
             print(f"  ⚠ 結果集達單一查詢上限 {_RESULT_LIMIT} 筆"
-                  f"（該條件共 {res['total']} 筆）→ 已改用法院分群逐桶收集。")
-            print("    法院分群的涵蓋上限為「各法院取前 500 筆」之總和，")
-            print("    若某法院在此條件下超過 500 筆，其較舊的部分仍取不到。")
+                  f"（該條件共 {res['total']} 筆）→ 已改用{_axis}逐桶收集。")
+            print(f"    {_axis}的涵蓋上限為「各桶取前 500 筆」之總和，")
+            print("    若某一桶在此條件下超過 500 筆，其較舊的部分仍取不到。")
             print("    需要完整資料請改用 crawl_batched.py —— 它會自動細分裁判日期區間，")
             print("    把每段壓到 500 筆以下，不受此限制。")
     else:
