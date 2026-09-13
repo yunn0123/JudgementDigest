@@ -45,6 +45,8 @@ python pipeline.py <keyword> -n <筆數> [選項]
 | `-o <檔名>` | 指定輸出 Excel 檔名，預設自動加時間戳 |
 | `--full-text` | Excel 含完整全文欄位（檔案較大） |
 | `--skip-crawl` | 跳過爬取，只重新解析 + 匯出（更新 parser 後使用） |
+| `--court <法院關鍵字>` | 只掃描名稱含此字串的法院（部分比對，例如 `臺北`），加速收集 |
+| `--case-type <案由代字>` | 只收集裁判字號含此代字的案件（部分比對，例如 `訴`、`易`） |
 
 依序執行爬取 → 解析 → 匯出 Excel，完成後在當前目錄產生 `judgments_借名登記_YYYYMMDD_HHMMSS.xlsx`。
 
@@ -88,10 +90,13 @@ python crawl_batched.py <keyword> -n <筆數> [選項]
 | `--start-date <日期>` | 精確起始日期 `YYYY/MM/DD` |
 | `--end-date <日期>` | 精確結束日期 `YYYY/MM/DD` |
 | `--no-headless` | 顯示瀏覽器視窗 |
+| `--court <法院關鍵字>` | 只掃描名稱含此字串的法院（部分比對） |
+| `--case-type <案由代字>` | 只收集裁判字號含此代字的案件（部分比對） |
 
 ```bash
 python crawl_batched.py 借名登記 -n 1000
 python crawl_batched.py 借名登記 -n 1000 --start-year 2018 --end-year 2023
+python crawl_batched.py 借名登記 -n 200 --start-date 2025/01/01 --end-date 2025/01/31 --court 臺北
 ```
 
 HTML 快取存於 `html_cache/`，爬取紀錄寫入 `judgments.db`。
