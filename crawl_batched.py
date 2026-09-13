@@ -17,8 +17,10 @@
   1. 初始段落：每段 = 一個公曆年，最新年在前
   2. 每段先讀摘要頁「查詢結果 N」：N >= 500 代表會被截斷 → 對半切分，較新的半段先處理
   3. N < 500 → 完整翻頁收集並下載
-  4. 切到單日仍 >= 500 → 日期無法再細分，改用法院分群（gy=jcourt）在該日內逐桶收集；
-     法院分群與日期條件不衝突，每個法院桶各自獨立計算 500 額度
+  4. 切到單日仍 >= 500 → 日期無法再細分，改用結果頁分群在該日內逐桶收集：
+     未指定法院時用法院分群（gy=jcourt），已指定法院時用案號年度分群（gy=jyear）。
+     分群與日期條件不衝突，每個桶各自獨立計算 500 額度；桶本身仍 >= 500 則記入
+     truncated_buckets 並在結束時列出
 
 用法:
     python crawl_batched.py 借名登記 -n 2000
@@ -38,14 +40,9 @@ from crawler import (
 )
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("crawler_batched.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
+# 日誌設定沿用 crawler.py（上方 import 時即已設定：主控台 + crawler.log）。
+# 這裡若再呼叫 basicConfig 不會生效 —— 根 logger 已有 handler 時 basicConfig 是 no-op，
+# 過去寫在這裡的 crawler_batched.log 因此一直是空檔。
 logger = logging.getLogger(__name__)
 
 # 每個日期區間一次最多取回的筆數；設為結果集上限，代表「該區間能拿的全部拿走」
@@ -125,6 +122,8 @@ def batched_crawl(
     case_types:    Tuple[str, ...] = (),
     judgment_type: str = "",
     delay:         float = _DEFAULT_DELAY,
+    pacer:         Optional[Pacer] = None,
+    stats:         Optional[dict] = None,
 ) -> int:
     """
     依裁判日期遞迴細分爬取，嚴格由新到舊。
@@ -142,6 +141,11 @@ def batched_crawl(
 
     delay 為請求基礎間隔（秒）。整個批次共用同一個 Pacer —— 降速狀態必須跨區段延續，
     否則每段都從全速重新開始，被擋之後會反覆踩同一個坑。
+    傳入 pacer 則沿用呼叫端的實例（例如跨月份連續爬取時延續降速狀態），此時忽略 delay。
+
+    stats 若提供，會就地填入本次批次的結果，供呼叫端判斷是否完整：
+      processed / total_new / failed_segments（未翻完的區段）/ truncated_days / pacer
+    清單在批次過程中即時更新，即使中途被中斷，呼叫端仍能看到已發生的部分。
     """
     init_db()
     label = build_label(keyword, court, case_types, judgment_type)
@@ -156,6 +160,11 @@ def batched_crawl(
     truncated_days: List[date] = []
     # 清單頁錯誤且復原失敗的區段 —— 這些區段沒有翻完，資料不完整，需要重跑
     failed_segments: List[Tuple[date, date, int]] = []
+    # 單日改用分群後，某個分群桶本身仍 >= 500 筆 → 該桶較舊的部分取不到
+    truncated_buckets: List[str] = []
+    if stats is not None:
+        stats.update(processed=0, total_new=0, failed_segments=failed_segments,
+                     truncated_days=truncated_days, truncated_buckets=truncated_buckets)
 
     logger.info(
         "開始批次爬取：keyword=%r  label=%r  court=%s  sys=%s  type=%s  "
@@ -166,7 +175,7 @@ def batched_crawl(
 
     # 整個批次共用一個 WebDriver 與一個 Pacer（降速狀態要跨區段延續）
     driver = build_driver(headless)
-    pacer  = Pacer(delay=delay)
+    pacer  = pacer if pacer is not None else Pacer(delay=delay)
     try:
         while stack and total_new < total_target:
             cs, ce = stack.pop()
@@ -204,6 +213,7 @@ def batched_crawl(
             driver = res.get("driver") or driver
             new = _db_count(label) - before
 
+            truncated_buckets.extend(res.get("truncated_buckets") or [])
             errs = int(res.get("page_errors", 0) or 0)
             if errs:
                 failed_segments.append((cs, ce, errs))
@@ -254,6 +264,12 @@ def batched_crawl(
             len(truncated_days), _RESULT_LIMIT,
             ", ".join(_fmt(d) for d in truncated_days[:10]),
         )
+    if truncated_buckets:
+        logger.warning(
+            "以下 %d 個分群桶本身即達 %d 筆上限，較舊的部分取不到（重跑無法補救）：\n%s",
+            len(truncated_buckets), _RESULT_LIMIT,
+            "\n".join(f"  {b}" for b in truncated_buckets),
+        )
     if failed_segments:
         logger.error(
             "以下 %d 個區段因清單頁錯誤未翻完，請以相同條件重跑這些日期：\n%s",
@@ -261,6 +277,8 @@ def batched_crawl(
             "\n".join(f"  --start-date {_fmt(a)} --end-date {_fmt(b)}（{n} 次錯誤）"
                       for a, b, n in failed_segments),
         )
+    if stats is not None:
+        stats.update(processed=processed, total_new=total_new, pacer=pacer.summary())
     return total_new
 
 

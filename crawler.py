@@ -956,7 +956,8 @@ def search_and_crawl(
                                   空 tuple = 全部類別
       judgment_type               裁判種類（「判決」或「裁定」）。進階搜尋沒有此欄位，
                                   於結果清單頁依裁判字號過濾 —— 在下載前就濾掉，
-                                  可大幅減少詳細頁請求數
+                                  可大幅減少詳細頁請求數。未給關鍵字時，另以該詞做
+                                  全文檢索當伺服器端粗篩，縮小結果集、減少翻頁
       keyword_label               寫入 DB keyword 欄的標籤。未指定時沿用 keyword；
                                   無關鍵字查詢（僅法院／類別）時用它標記這批資料，
                                   供 export_excel 的 -k 篩選
@@ -967,7 +968,9 @@ def search_and_crawl(
       skip_if_truncated           True 時，一旦偵測到結果被截斷就立即返回不翻頁
 
     回傳 {"collected": 實際下載數, "total": 該區間總筆數, "truncated": 是否被截斷,
-          "page_errors": 清單頁錯誤且復原失敗的次數, "driver": 目前有效的 WebDriver}
+          "page_errors": 清單頁錯誤且復原失敗的次數,
+          "truncated_buckets": 本身即達 500 上限的分群桶（資料不完整、重跑也救不回）,
+          "driver": 目前有效的 WebDriver}
     page_errors > 0 代表該區段的清單沒有翻完，資料不完整，呼叫端應重跑該區段。
     注意 driver：Phase B 每 80 筆會重建 session（舊的會被 quit），
     因此傳入自己的 driver 時，下一次呼叫務必改用回傳的這一個。
@@ -982,6 +985,12 @@ def search_and_crawl(
         pacer = Pacer()
     collected = 0
     page_errors = 0       # 清單頁出現錯誤頁且無法復原的次數（> 0 代表該區段可能不完整）
+    truncated_buckets: List[str] = []   # 分群桶本身 >= 500 筆而被截斷（重跑也救不回）
+    # 只要某種裁判（判決／裁定）且沒有關鍵字時，以該詞做全文檢索當伺服器端粗篩：
+    # 每份判決書本文（標題「…民事判決」、「判決如下」）必含「判決」，大量本票類裁定則不含，
+    # 實測單日 976 筆 → 55 筆、漏抓 0。結果集縮小後幾乎不會再破 500 上限，翻頁量也大減。
+    # 清單頁仍會依裁判字號精篩，所以粗篩多抓進來的裁定不會被下載。
+    query_keyword = keyword or judgment_type
     total: Optional[int] = None
     truncated = False
     court_links: List[Tuple[str, str]] = []
@@ -991,11 +1000,12 @@ def search_and_crawl(
         # ── 1. 進階搜尋取得該日期區間專屬的結果集 ─────────────────────
         pacer.wait("query")
         base_results_url, total = _ad_search(
-            driver, keyword, start_date, end_date, court, tuple(case_types))
+            driver, query_keyword, start_date, end_date, court, tuple(case_types))
         if not base_results_url:
             logger.error("Advanced search returned no results URL — aborting")
             return {"collected": 0, "total": total, "truncated": False,
-                    "page_errors": page_errors, "driver": driver}
+                    "page_errors": page_errors,
+            "truncated_buckets": truncated_buckets, "driver": driver}
 
         # ── 2. 判斷是否觸及單一結果集上限 ─────────────────────────────
         # 結果按裁判日期由新到舊排序，截斷時被砍掉的是最舊的部分。
@@ -1008,7 +1018,8 @@ def search_and_crawl(
             if skip_if_truncated:
                 logger.info("skip_if_truncated — returning for caller to split")
                 return {"collected": 0, "total": total, "truncated": True,
-                        "page_errors": page_errors, "driver": driver}
+                        "page_errors": page_errors,
+            "truncated_buckets": truncated_buckets, "driver": driver}
 
             # 呼叫端表示已無法再切分日期（例如區間已縮到單日），
             # 最後手段：改用結果頁分群把同一個日期區間再切細。
@@ -1089,7 +1100,7 @@ def search_and_crawl(
 
             # q hash 已失效 → 重送查詢。分群參數（gy/gc）沿用舊網址的設定。
             new_url, _new_total = _ad_search(
-                driver, keyword, start_date, end_date, court, tuple(case_types))
+                driver, query_keyword, start_date, end_date, court, tuple(case_types))
             if not new_url:
                 return False
             driver.get(_page_url(_carry_group_params(base_url, new_url), page))
@@ -1098,10 +1109,15 @@ def search_and_crawl(
             logger.info("  ↳ 重新查詢後%s（page=%d）", "復原成功" if ok else "仍失敗", page)
             return ok
 
-        def _paginate(label: str, base_url: str = "") -> None:
-            """從目前頁面一路翻頁收集，直到無下一頁或達 max_results。"""
+        def _paginate(label: str, base_url: str = "") -> int:
+            """
+            從目前頁面一路翻頁收集，直到無下一頁或達 max_results。
+            回傳翻到的原始列數（過濾前）—— 判斷分群桶是否撞到 500 上限必須看這個，
+            看過濾後的筆數會在只收判決時嚴重低估，截斷就會被忽略。
+            """
             nonlocal page_errors
             page = 1
+            raw_seen = 0
             while len(all_items) < max_results:
                 raw_items = _parse_case_rows(driver)
                 if not raw_items:
@@ -1117,6 +1133,7 @@ def search_and_crawl(
                             marker, label or "", page,
                         )
                     break
+                raw_seen += len(raw_items)
                 fresh = [it for it in _filter_by_judgment_type(_filter_by_case_year(raw_items))
                          if it.get("url") and it["url"] not in seen_urls]
                 needed = max_results - len(all_items)
@@ -1131,6 +1148,7 @@ def search_and_crawl(
                     break
                 page += 1
                 pacer.wait("list")
+            return raw_seen
 
         if court_links:
             # 最後手段路徑：同一日期區間內再依法院逐桶收集
@@ -1140,7 +1158,13 @@ def search_and_crawl(
                 logger.info("  [Court] %s", court_label)
                 driver.get(court_url)
                 time.sleep(2.0)
-                _paginate(f"  [{court_label}]", court_url)
+                raw = _paginate(f"  [{court_label}]", court_url)
+                if raw >= _RESULT_LIMIT:
+                    truncated_buckets.append(f"{start_date}~{end_date} {court_label}")
+                    logger.warning(
+                        "  ⚠ 法院桶 %s 翻到 %d 列已達單一結果集上限，該桶較舊的部分取不到",
+                        court_label, raw,
+                    )
         elif year_links:
             # 伺服器端案號年度篩選：只翻符合年度的桶（由新到舊）。
             # _paginate 內仍會套用本地過濾 —— 統括桶需要它才能精確切到範圍，
@@ -1152,12 +1176,12 @@ def search_and_crawl(
                 logger.info("  [CaseYear] %s", tag)
                 driver.get(year_url)
                 time.sleep(2.0)
-                _before = len(all_items)
-                _paginate(f"  [{tag}]", year_url)
-                if len(all_items) - _before >= _RESULT_LIMIT:
+                raw = _paginate(f"  [{tag}]", year_url)
+                if raw >= _RESULT_LIMIT:
+                    truncated_buckets.append(f"{start_date}~{end_date} {tag}")
                     logger.warning(
-                        "  ⚠ 年度桶 %s 取得 %d 筆已達上限，該桶可能仍有遺漏",
-                        tag, len(all_items) - _before,
+                        "  ⚠ 年度桶 %s 翻到 %d 列已達單一結果集上限，該桶較舊的部分取不到",
+                        tag, raw,
                     )
         else:
             driver.get(base_results_url)
@@ -1271,7 +1295,8 @@ def search_and_crawl(
     # driver 一併回傳：Phase B 每 80 筆會重建 session，舊的已被 quit，
     # 呼叫端必須換用回傳的這個，否則下一段會拿到失效的 session。
     return {"collected": collected, "total": total, "truncated": truncated,
-            "page_errors": page_errors, "driver": driver}
+            "page_errors": page_errors,
+            "truncated_buckets": truncated_buckets, "driver": driver}
 
 
 # ─── 重新爬取 stub 紀錄 ───────────────────────────────────────────────────────
