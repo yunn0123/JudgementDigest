@@ -27,3 +27,7 @@ update_pptx.py
 
 # 測試 fixture 不受上面 *_page.html 規則影響
 !tests/fixtures/*.html
+
+# 逐月爬取的進度狀態檔（本機執行紀錄）
+crawl_state_*.json
+crawl_state_*.json.tmp

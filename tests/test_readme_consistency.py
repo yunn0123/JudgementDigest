@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 SCRIPTS = [
-    "pipeline.py", "crawl_batched.py", "crawler.py",
+    "pipeline.py", "crawl_batched.py", "crawl_monthly.py", "crawler.py",
     "html_parser.py", "export_excel.py", "tests/live_check.py",
 ]
 
