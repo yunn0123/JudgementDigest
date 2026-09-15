@@ -17,6 +17,7 @@ LAW_RE = re.compile(
     rf"([^，、；。：（）()\s]{{2,18}}?(?:條例|法))第[{NUM}]+條"
     rf"(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?"
 )
+CHARGE_AFTER_LAW_RE = re.compile(r"之?([^，、；。]{2,80}罪)(?=[，、；。]|$)")
 TOTAL_RE = re.compile(
     rf"應執行(?:之刑為)?(死刑|無期徒刑|有期徒刑[{NUM}]+年(?:[{NUM}]+月)?|"
     rf"有期徒刑[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM}]+元)"
@@ -101,15 +102,18 @@ def extract_laws(reason: str, applicable_laws: str) -> list[str]:
     return unique(law for law in found if not law.startswith(("刑事訴訟法", "刑法施行法")))
 
 
-# 優先從論罪句取得罪名，再以主文中的「犯○○罪」補足未命中的案件。
+# 從已命中的法條結尾定位罪名，避免罪名內的「之」造成截斷，再以主文補強。
 def extract_charges(verdict: str, reason: str) -> list[str]:
     charges = []
     for sentence in re.split(r"[。；]", reason):
         if "係犯" not in sentence and not ("違反" in sentence and "罪" in sentence):
             continue
-        charges.extend(re.findall(r"之([^，、；。]{2,40}?罪)(?=[，、；。]|$)", sentence))
-    charges.extend(re.findall(r"犯(?:如附表[^，。]{0,30}之罪|([^，。；]{2,40}?罪))", verdict))
-    return unique(re.sub(r"^.*之", "", charge).lstrip("共同") for charge in charges if charge)
+        for law_match in LAW_RE.finditer(sentence):
+            charge_match = CHARGE_AFTER_LAW_RE.match(sentence, law_match.end())
+            if charge_match:
+                charges.append(charge_match.group(1))
+    charges.extend(re.findall(r"犯(?:如附表[^，。]{0,30}之罪|([^，。；]{2,80}?罪))", verdict))
+    return unique(charge.removeprefix("共同") for charge in charges if charge)
 
 
 # 只取「應執行」刑；僅有一個宣告刑時才安全地作為單罪案件總刑期。
@@ -144,11 +148,12 @@ def structure_row(row: dict) -> list[str]:
     sentences, status = extract_sentences(verdict)
     charges = extract_charges(verdict, reason)
     laws = extract_laws(reason, applicable_laws)
-    if ("如附表" in verdict and not charges) or (case_result(verdict) in ("有罪", "混合") and not laws):
+    result = case_result(verdict)
+    if ("如附表" in verdict and not charges) or (result in ("有罪", "混合") and (not laws or not charges)):
         status = "需人工核對"
     return [
         row.get("裁判字號", ""), row.get("裁判書連結", ""),
-        row.get("裁判種類", ""), row.get("案件類型", ""), case_result(verdict),
+        row.get("裁判種類", ""), row.get("案件類型", ""), result,
         labels(laws), labels(charges), labels(sentences), labels(sentence_months(sentences)), status,
     ]
 
@@ -202,12 +207,22 @@ def self_check() -> None:
     assert case_result("甲犯竊盜罪，處有期徒刑參月。乙無罪。") == "混合"
     terms, status = extract_sentences("各處有期徒刑參月。應執行有期徒刑壹年貳月。")
     assert terms == ["有期徒刑壹年貳月"] and sentence_months(terms) == ["14"] and status == "完整"
+    assert extract_charges("", compact(
+        "核被告所為，係犯刑法第185條之3第1項第3款之"
+        "駕駛動力交通工具而有尿液所含毒品達行政院公告之品項及濃度值以上之情形罪。"
+    )) == ["駕駛動力交通工具而有尿液所含毒品達行政院公告之品項及濃度值以上之情形罪"]
+    assert extract_charges("", compact(
+        "核被告所為，係犯毒品危害防制條例第10條第2項施用第二級毒品罪。"
+    )) == ["施用第二級毒品罪"]
+    assert structure_row({
+        "主文": "甲犯如附表所示之罪，應執行有期徒刑壹年。",
+    })[-1] == "需人工核對"
 
 
 # 提供可直接套用預設檔名的命令列入口，也允許覆寫輸入與輸出路徑。
 def main() -> None:
     parser = argparse.ArgumentParser(description="萃取每案罪名、法條與總執行刑")
-    parser.add_argument("input", nargs="?", default="25_04-06.xlsx", type=Path)
+    parser.add_argument("input", nargs="?", default="25_07-12.xlsx", type=Path)
     parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args()
     output = args.output or args.input.with_name(f"{args.input.stem}_structured.xlsx")
