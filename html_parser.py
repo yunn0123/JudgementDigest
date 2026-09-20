@@ -368,6 +368,12 @@ def _extract_sections_text_pre(text_pre_elem) -> Tuple[Dict[str, str], str, List
 
 
 # ─── Step 3：將正文容器依段落標題切割成 sections ──────────────────────────────
+_PLAIN_HEADINGS = frozenset({
+    "犯罪事實及理由", "事實及理由", "事實暨理由", "事實與理由",
+    "犯罪事實", "事實", "理由", "結論", "據上論斷",
+})
+
+
 def _extract_sections(container) -> Tuple[Dict[str, str], str, List[str]]:
     """
     回傳:
@@ -416,12 +422,17 @@ def _extract_sections(container) -> Tuple[Dict[str, str], str, List[str]]:
 
         full_parts.append(text)
 
-        is_heading = (
+        is_heading = bool(
             "notEdit" in classes                              # 新舊格式都有
             and "he-h1" not in classes                        # 排除法院名稱大標
             and len(text) <= 20                               # 標題不應太長
             and re.search(r'[主文事實理由結論法條犯罪據上聲明陳述附]', text)
         )
+        # 簡易判決的「犯罪事實及理由」等後段標題常是貼上的一般段落（無 notEdit），
+        # 過去會被併進主文；標題文字剛好等於已知標題時，在主文之後也視為標題。
+        if (not is_heading and not in_preamble
+                and _normalize_section_title(text) in _PLAIN_HEADINGS):
+            is_heading = True
 
         if is_heading:
             flush()
@@ -857,6 +868,7 @@ def parse_html(
         sections.get("事實及理由", "")
         or sections.get("事實暨理由", "")
         or sections.get("事實與理由", "")
+        or sections.get("犯罪事實及理由", "")
     )
     facts_val   = sections.get("事實", "")
     reasons_val = (
