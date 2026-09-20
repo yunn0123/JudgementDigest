@@ -207,6 +207,7 @@ def batched_advanced_crawl(
     end_date:       date,
     total_target:   int,
     headless:       bool,
+    judgment_type:  str = "",
 ) -> int:
     """
     用進階搜尋（Default_AD.aspx，不需關鍵字）做廣度優先批次爬取。
@@ -255,6 +256,7 @@ def batched_advanced_crawl(
                 end_date=_fmt(ce),
                 max_results=chunk_target,
                 headless=headless,
+                judgment_type=judgment_type,
             )
             new        = _db_count(keyword_tag) - before
             total_new += new
@@ -339,6 +341,8 @@ if __name__ == "__main__":
     ap.add_argument("--category",  default="", help="裁判類別（部分比對，例如「刑事」「民事」「行政」）")
     ap.add_argument("--advanced", action="store_true",
                     help="使用進階搜尋（Default_AD.aspx），不需關鍵字，用 --court + --category 直接篩選")
+    ap.add_argument("--judgment-type", default="",
+                    help="只下載特定裁判種類（例如「判決」；僅 --advanced 模式），下載前依裁判字號結尾略過其餘")
     args = ap.parse_args()
 
     today = date.today()
@@ -368,6 +372,7 @@ if __name__ == "__main__":
             end_date=ed,
             total_target=args.num,
             headless=not args.no_headless,
+            judgment_type=args.judgment_type,
         )
     else:
         if not args.keyword:

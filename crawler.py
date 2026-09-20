@@ -978,6 +978,7 @@ def advanced_search_and_crawl(
     end_date:        str,
     max_results:     int  = 500,
     headless:        bool = True,
+    judgment_type:   str  = "",
 ) -> Tuple[int, Optional[int]]:
     """
     用進階搜尋頁（Default_AD.aspx）以法院代碼 + 案件類別 + 精確日期區間查詢，
@@ -989,9 +990,12 @@ def advanced_search_and_crawl(
                      空列表代表不勾選（等同網站「未勾選預設為全選」）
     start_date/end_date: 西元日期 "YYYY/MM/DD"
     max_results:    本次查詢最多收集筆數（單次查詢上限約 500 筆，超過需自行切分日期區間）
+    judgment_type:  裁判種類篩選（例如「判決」或「裁定」），比對列表頁裁判字號結尾；
+                     不符的案件在下載前就略過，只省下載時間，不影響翻頁與完整性檢查
 
     回傳 (collected, reported_total)：
-        collected      = 實際下載成功的筆數
+        collected      = 實際下載成功的筆數（加上因 judgment_type 被略過的筆數，
+                          讓呼叫端仍能拿它跟 reported_total 比對是否漏抓）
         reported_total = 網站回報的「共 X 筆」總數（可能大於 collected，甚至大於
                           max_results —— 網站硬性上限每查詢最多 500 筆 / 25 頁可翻，
                           呼叫端應以此值判斷是否需要切分區間，而非只看 collected）
@@ -1002,6 +1006,7 @@ def advanced_search_and_crawl(
     driver = build_driver(headless)
     wait   = WebDriverWait(driver, 30)
     collected = 0
+    skipped = 0
     reported_total: Optional[int] = None
     keyword = f"ADV:{','.join(court_codes)}:{','.join(category_codes)}"
 
@@ -1122,7 +1127,15 @@ def advanced_search_and_crawl(
 
         logger.info("Advanced search Phase A complete — %d cases queued", len(all_items))
 
-        collected, driver = _download_items(driver, all_items, headless, keyword)
+        to_download = all_items
+        if judgment_type:
+            to_download = [it for it in all_items if judgment_type in it.get("case_number", "")]
+            skipped = len(all_items) - len(to_download)
+            logger.info("Judgment-type filter %r: %d to download, %d skipped",
+                        judgment_type, len(to_download), skipped)
+
+        collected, driver = _download_items(driver, to_download, headless, keyword)
+        collected += skipped
 
     except WebDriverException as exc:
         logger.error("WebDriver error (outer): %s", exc, exc_info=True)
@@ -1216,6 +1229,8 @@ if __name__ == "__main__":
                     help="重新爬取資料庫中所有 stub/不完整 HTML（不需關鍵字）")
     ap.add_argument("--advanced", action="store_true",
                     help="使用進階搜尋（Default_AD.aspx），不需關鍵字，用 --court + --category 直接篩選")
+    ap.add_argument("--judgment-type", default="",
+                    help="只下載特定裁判種類（例如「判決」；僅 --advanced 模式），下載前依裁判字號結尾略過其餘")
     args = ap.parse_args()
 
     if args.recrawl_stubs:
@@ -1236,6 +1251,7 @@ if __name__ == "__main__":
                 end_date=args.end_date,
                 max_results=args.num,
                 headless=not args.no_headless,
+                judgment_type=args.judgment_type,
             )
             if reported_total and reported_total > args.num:
                 print(f"（提醒：網站回報此區間共有 {reported_total} 筆，超過本次目標 {args.num} 筆，"

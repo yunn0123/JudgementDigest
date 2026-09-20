@@ -39,6 +39,7 @@ def run(
     case_type: str = "",
     category: str = "",
     advanced: bool = False,
+    judgment_type: str = "",
 ) -> None:
     sep = "=" * 60
 
@@ -58,6 +59,8 @@ def run(
         print(f"  案由代字  : {case_type}")
     if category:
         print(f"  裁判類別  : {category}")
+    if judgment_type:
+        print(f"  裁判種類  : 只下載「{judgment_type}」")
     if skip_crawl:
         print("  ⚠ --skip-crawl：跳過爬取，直接解析 + 匯出")
     print(sep)
@@ -88,6 +91,7 @@ def run(
                     end_date=end_date,
                     total_target=max_results,
                     headless=headless,
+                    judgment_type=judgment_type,
                 )
             else:
                 from crawl_batched import batched_crawl
@@ -198,6 +202,10 @@ if __name__ == "__main__":
         "--advanced", action="store_true",
         help="使用進階搜尋（Default_AD.aspx），不需關鍵字，用 --court + --category 直接篩選、完整抓取",
     )
+    ap.add_argument(
+        "--judgment-type", default="",
+        help="只下載特定裁判種類（例如「判決」；僅 --advanced 模式），下載前依裁判字號結尾略過其餘",
+    )
     args = ap.parse_args()
 
     if not args.advanced and not args.keyword:
@@ -230,4 +238,5 @@ if __name__ == "__main__":
         case_type=args.case_type,
         category=args.category,
         advanced=args.advanced,
+        judgment_type=args.judgment_type,
     )
