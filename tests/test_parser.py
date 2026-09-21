@@ -81,6 +81,15 @@ class TestParseCivilJudgment(unittest.TestCase):
     def test_keyword_label_carried(self):
         self.assertEqual(self.data["keyword"], "臺灣臺北地方法院-民事-判決")
 
+    def test_reasons_heading_not_merged_into_verdict(self):
+        # 「事實及理由」單獨成行（非 notEdit 標題）時，曾被併進主文、事實及理由欄變空
+        verdict = self.data["verdict"]
+        self.assertLess(len(verdict), 300)
+        self.assertNotIn("為有理由", verdict)
+        self.assertNotIn("爰判決如主文", verdict)
+        self.assertGreater(len(self.data["facts_and_reasons"]), 300)
+        self.assertIn("爰判決如主文", self.data["facts_and_reasons"])
+
 
 class TestParseConstitutionalCourtRuling(unittest.TestCase):
     """憲法法庭是 text-pre 版型，欄位切法與一般法院不同。"""
