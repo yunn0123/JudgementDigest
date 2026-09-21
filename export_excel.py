@@ -24,6 +24,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 from typing import Optional, List, Dict
+from html_parser import normalize_date   # 日期正規化（西元 ISO）共用同一套實作
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import (
@@ -104,12 +105,14 @@ def fetch_judgments(
     if court:
         sql += " AND court LIKE ?"
         params.append(f"%{court}%")
+    # judgment_date 以西元 ISO（YYYY-MM-DD）儲存，可直接字串比較；
+    # 使用者輸入一律先正規化，避免格式不一致導致篩選失效。
     if start_date:
         sql += " AND judgment_date >= ?"
-        params.append(start_date)
+        params.append(normalize_date(start_date) or start_date)
     if end_date:
         sql += " AND judgment_date <= ?"
-        params.append(end_date)
+        params.append(normalize_date(end_date) or end_date)
 
     sql += " ORDER BY parsed_at DESC"
     if limit:
@@ -250,9 +253,9 @@ if __name__ == "__main__":
     ap.add_argument("-c",  "--court",      default="",
                     help="篩選法院（部分比對）")
     ap.add_argument("--start-date",        default="",
-                    help="裁判日期起")
+                    help="裁判日期起（YYYY/MM/DD 或民國格式皆可）")
     ap.add_argument("--end-date",          default="",
-                    help="裁判日期迄")
+                    help="裁判日期迄（YYYY/MM/DD 或民國格式皆可）")
     ap.add_argument("--offset", type=int,  default=0,
                     help="略過前 N 筆")
     ap.add_argument("--full-text",         action="store_true",

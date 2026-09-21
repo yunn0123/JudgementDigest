@@ -1,0 +1,40 @@
+name: tests
+
+# 只跑離線測試：單元測試 + 以 tests/fixtures 為樣本的解析測試。
+# 需要連線司法院網站的端到端檢查（tests/live_check.py）刻意不放進 CI：
+#   1. 對方有 bot-defense，雲端 IP 幾乎必被擋，會變成假失敗
+#   2. 不該讓 CI 定期去打政府機關的伺服器
+# 網站改版的偵測請在本機手動跑：python tests/live_check.py
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安裝相依套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 語法檢查
+        run: python -m compileall -q crawler.py crawl_batched.py html_parser.py export_excel.py pipeline.py
+
+      - name: 離線測試
+        run: python -m unittest discover -s tests -t . -v

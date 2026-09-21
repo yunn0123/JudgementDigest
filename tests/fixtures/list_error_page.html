@@ -1,0 +1,112 @@
+<html lang="zh-TW"><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta http-equiv="CACHE-CONTROL" content="NO-CACHE">
+    <meta property="og:image" content="https://judgment.judicial.gov.twfblogo.png">
+    <title>
+	系統訊息
+</title><link rel="stylesheet" href="../css/bootstrap.min.css"><link rel="stylesheet" href="../css/font-awesome.min.css"><link rel="stylesheet" href="../css/iframe.css">
+    <script type="text/javascript" src="/js/jquery-3.6.0.min.js"></script>    
+    <script type="text/javascript" src="/js/isMobile.js"></script>
+    <!--引用司法院內網的網頁字型 javascript -->
+    <script type="text/javascript" src="https://tpjwebfont2.judicial.gov.tw/WebFont/cmexwebfont.js"></script>
+    <script async="" src="https://www.googletagmanager.com/gtag/js?id=UA-100643133-1"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag() { dataLayer.push(arguments); }
+        gtag('js', new Date());
+
+        gtag('config', 'UA-100643133-1');
+    </script>
+
+    <!-- Google tag (gtag.js) --> <script async="" src="https://www.googletagmanager.com/gtag/js?id=G-NB3N15LK5E"></script>
+    <script> window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', 'G-NB3N15LK5E'); </script>		
+	
+    <meta name="robots" content="noindex"></head>
+<body>
+    <form method="post" action="../errorpage.aspx?frm=t&amp;err=Q001" id="form1">
+<div class="aspNetHidden">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="EiRWv8A4B3MHXXmFUk6+rX8vj3Oz76HgqBJJ36rre9btUr+Q9RVTTkimtmCFUllkM6P3pQ==">
+</div>
+
+<div class="aspNetHidden">
+
+	<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="5ED29197">
+	<input type="hidden" name="__VIEWSTATEENCRYPTED" id="__VIEWSTATEENCRYPTED" value="">
+</div>
+    <div class="container">
+        <h1 style="display:none"></h1>
+        
+<div style="margin:0 20px;">
+<div class="page-header">
+  
+    <h3>查詢設定錯誤</h3>
+</div>
+<div class="main-section">
+    <p>請重新設定查詢條件後查詢。</p>
+</div>
+</div>
+
+    </div>
+    </form>
+
+
+<script type="text/javascript" src="/js/bootstrap.min.js"></script>
+<script type="text/javascript" src="/js/iframeautohight.js"></script>
+<script type="text/javascript" src="/js/functions.js"></script>
+<script>
+    $(".hlTitle_scroll").click(function () {
+        var expires = new Date();
+        //有效時間保存 3分鐘 3*60*1000
+        expires.setTime(expires.getTime() + 180000);
+        var scroll = parent.document.documentElement.scrollTop;
+        document.cookie = "yPos=!~" + scroll + "~!" + ";expires=" + expires.toGMTString() + ";path=/";
+    });
+
+    $(function () {
+        if (!!window.performance && window.performance.navigation.type === 2) {
+            //!! 用來檢查 window.performance 是否存在
+            //window.performance.navigation.type ===2 表示使用 back or forward
+            var strCook = document.cookie;
+            if (strCook.indexOf("!~") != 0) {
+                var intS = strCook.indexOf("!~");
+                var intE = strCook.indexOf("~!");
+                var strPos = strCook.substring(intS + 2, intE);
+                top.$("body,html").animate({ scrollTop: strPos }, 0);
+                document.cookie = "";
+            }
+        }
+        else
+        {
+            //iframe換頁後，必須至頂
+            if (parent.document.documentElement.scrollTop != 0) { top.$("body,html").animate({ scrollTop: 0 }, 0); }
+        }
+        //避免XFS攻擊
+        if (top.location.hostname != self.location.hostname) { top.location = self.location; }
+        //如果法規放在iframe裡，那Master要改用iframe.master
+        if ($("#iframe-data", window.parent.document) != undefined) {
+            var queryVars = { 'ot': 'in' };
+         
+            $("a:not(.eng)").each(function (index) {
+                var url = $(this).attr("href");
+                var target = $(this).attr("target");
+                /*
+                if (url.indexOf("https://cons-test.judicial.gov.tw/") >= 0)
+                {
+                    return;
+                }
+                */
+                try {
+                    if (url != undefined && url.substring(0, 1) != "#" && target != "_blank" && target != "_parent") {
+                        if (url.indexOf('ot=in') == -1) {
+                            var separator = url.indexOf('?') !== -1 ? "&" : "?";
+                            url = url + separator + "ot=in";
+                            $(this).attr("href", url);
+                        }
+                    }
+                } catch (err) {
+                    alert(err.message);
+                }
+            });
+        }
+    });
+</script>
+
+</body></html>
