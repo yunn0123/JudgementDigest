@@ -135,6 +135,37 @@ _COURT_VALID_RE = re.compile(r"法院")
 _DATE_HINT_RE   = re.compile(r"\d{2,3}[./年]\d{1,2}")
 
 
+# ─── 日期正規化 ───────────────────────────────────────────────────────────────
+# 裁判書頁面的「裁判日期」顯示為「民國 115 年 04 月 24 日」，
+# 結果列表則是「115.04.17」，兩者都無法用字串比較排序
+# （"民" 是 CJK 字元，永遠大於任何 ASCII 數字開頭的字串，
+#   會讓 SQL 的 judgment_date >= ? / <= ? 篩選完全失效）。
+# 一律正規化為西元 ISO YYYY-MM-DD，即可直接比較與排序。
+_ROC_CN_RE  = re.compile(r"(?:民國\s*)?(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_ROC_DOT_RE = re.compile(r"^(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})$")
+_AD_ISO_RE  = re.compile(r"^(\d{4})[./-](\d{1,2})[./-](\d{1,2})$")
+
+
+def normalize_date(raw: str) -> str:
+    """
+    將各種裁判日期寫法正規化為西元 ISO YYYY-MM-DD。
+    支援：「民國 115 年 04 月 24 日」、「115.04.17」、「2026/04/24」、「2026-04-24」。
+    無法解析時回傳空字串（呼叫端應保留原值或視為未知）。
+    """
+    if not raw:
+        return ""
+    t = raw.strip()
+    m = _AD_ISO_RE.match(t)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    m = _ROC_DOT_RE.match(t) or _ROC_CN_RE.search(t)
+    if m:
+        ry, mo, d = (int(x) for x in m.groups())
+        return f"{ry + 1911:04d}-{mo:02d}-{d:02d}"
+    return ""
+
+
 # ─── 資料庫 ───────────────────────────────────────────────────────────────────
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -268,7 +299,8 @@ def _extract_metadata(soup: BeautifulSoup) -> Dict[str, str]:
         elif "裁判法院" in label:
             meta["court"] = value          # 若有獨立欄位則優先使用
         elif "裁判日期" in label:
-            meta["judgment_date"] = value
+            # 正規化為西元 ISO，確保 SQL 日期篩選與排序可用；無法解析則保留原字串
+            meta["judgment_date"] = normalize_date(value) or value
         elif "案件類型" in label or "裁判案由" in label:
             meta["case_type"] = value
 
@@ -368,6 +400,12 @@ def _extract_sections_text_pre(text_pre_elem) -> Tuple[Dict[str, str], str, List
 
 
 # ─── Step 3：將正文容器依段落標題切割成 sections ──────────────────────────────
+_PLAIN_HEADINGS = frozenset({
+    "犯罪事實及理由", "事實及理由", "事實暨理由", "事實與理由",
+    "犯罪事實", "事實", "理由", "結論", "據上論斷",
+})
+
+
 def _extract_sections(container) -> Tuple[Dict[str, str], str, List[str]]:
     """
     回傳:
@@ -416,12 +454,17 @@ def _extract_sections(container) -> Tuple[Dict[str, str], str, List[str]]:
 
         full_parts.append(text)
 
-        is_heading = (
+        is_heading = bool(
             "notEdit" in classes                              # 新舊格式都有
             and "he-h1" not in classes                        # 排除法院名稱大標
             and len(text) <= 20                               # 標題不應太長
             and re.search(r'[主文事實理由結論法條犯罪據上聲明陳述附]', text)
         )
+        # 簡易判決的「犯罪事實及理由」等後段標題常是貼上的一般段落（無 notEdit），
+        # 過去會被併進主文；標題文字剛好等於已知標題時，在主文之後也視為標題。
+        if (not is_heading and not in_preamble
+                and _normalize_section_title(text) in _PLAIN_HEADINGS):
+            is_heading = True
 
         if is_heading:
             flush()
@@ -830,9 +873,11 @@ def parse_html(
                     meta["court"] = cm.group(1).strip()
 
     if not meta["judgment_date"]:
-        # 驗證 date_hint：必須含日期格式，否則可能是誤填的案件類型
-        if date_hint and _DATE_HINT_RE.search(date_hint):
-            meta["judgment_date"] = date_hint
+        # 備援：用 crawl_records 帶進來的日期。
+        # 舊版 crawl_records 曾把「案由」誤存在 judgment_date 欄，
+        # normalize_date() 解析失敗即自然排除這類髒資料。
+        if date_hint:
+            meta["judgment_date"] = normalize_date(date_hint)
 
     # 2. 正文容器
     container = _find_content_container(soup)
@@ -857,6 +902,7 @@ def parse_html(
         sections.get("事實及理由", "")
         or sections.get("事實暨理由", "")
         or sections.get("事實與理由", "")
+        or sections.get("犯罪事實及理由", "")
     )
     facts_val   = sections.get("事實", "")
     reasons_val = (
