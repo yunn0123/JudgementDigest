@@ -36,7 +36,8 @@ def build(keyword: str = "ADV:TPD:M") -> None:
     rows = conn.execute(
         "SELECT c.id, c.case_number, c.html_file, j.defendant FROM crawl_records c "
         "LEFT JOIN judgments j ON j.crawl_id = c.id "
-        "WHERE c.keyword LIKE ? AND c.case_number LIKE '%判決'", (keyword + "%",)).fetchall()
+        "WHERE c.keyword LIKE ? AND c.case_number LIKE '%判決' "
+        "AND instr(COALESCE(j.full_text, ''), '判決') > 0", (keyword + "%",)).fetchall()
     hit = n = 0
     for crawl_id, case_number, html_file, defendants in rows:
         try:

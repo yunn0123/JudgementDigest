@@ -210,6 +210,7 @@ python export_excel.py [選項]
 | `--start-date <日期>` | 篩選裁判日期起（`YYYY/MM/DD` 或民國格式皆可） |
 | `--end-date <日期>` | 篩選裁判日期迄（`YYYY/MM/DD` 或民國格式皆可） |
 | `--offset <N>` | 略過前 N 筆 |
+| `--exclude-mislabeled` | 排除案號標「判決」但全文不含「判決」的裁定（附民移送、單獨宣告沒收、再開辯論等） |
 | `--full-text` | 含完整全文欄位（檔案較大） |
 | `-o <檔名>` | 指定輸出檔名 |
 
