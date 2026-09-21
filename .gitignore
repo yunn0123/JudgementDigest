@@ -24,3 +24,8 @@ check_html2.py
 diagnose.py
 add_role_stats_slide.py
 update_pptx.py
+merge.py
+
+*.ipynb
+
+finaldata/
