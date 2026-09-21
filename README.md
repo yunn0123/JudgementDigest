@@ -440,3 +440,23 @@ crawl_batched.py
   `法官` 約 2% 空白、`主文` 0.5% 空白。改善方式是修改 `html_parser.py` 後執行
   `python html_parser.py --reparse`，會從 `html_cache/` 重建，**不需重爬**
 - **`export_excel.py` 的排序固定為解析時間**；依裁判日期排序請用 `crawl_monthly.py --export-only`
+
+---
+
+## 附表宣告刑（`offenses` 表）
+
+多被告、多罪的刑事判決，主文只寫「如附表所示」時，`build_offenses.py` 會讀 HTML 附表，
+一列一個「被告 × 罪 × 宣告刑」寫入 `offenses` 表（每次執行整張重建）。
+
+```bash
+python build_offenses.py --keyword "臺灣臺北地方法院-刑事-判決" -o offenses.xlsx
+python build_offenses.py --export-only -o offenses.xlsx   # 不重建，只匯出現有內容
+```
+
+| 參數 | 說明 |
+|---|---|
+| `--keyword <標籤>` | 處理 `crawl_records.keyword` 以此開頭的判決（預設 `ADV:TPD:M`） |
+| `-o` / `--output <檔名>` | 匯出 Excel（欄位：裁判字號、裁判日期、被告、法條、罪名、宣告刑、宣告刑（月）、拘役（日）、併科罰金（元）、附表列號、原文） |
+| `--export-only` | 不重建表，只匯出（需搭配 `-o`） |
+
+只處理全文含「判決」的案件（排除案號標「判決」實為裁定者）。

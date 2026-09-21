@@ -1,7 +1,8 @@
 """從 html_cache 的附表建立 offenses 表（一列 = 一個被告的一個罪的一個宣告刑）。
 
 不動 judgments 表，可重複執行（每次重建 offenses）。
-用法: python build_offenses.py [--keyword ADV:TPD:M]
+用法: python build_offenses.py [--keyword ADV:TPD:M] [-o offenses.xlsx]
+      加 -o 時建表後匯出 Excel；只想匯出、不重建可加 --export-only。
 """
 
 import argparse
@@ -59,7 +60,55 @@ def build(keyword: str = "ADV:TPD:M") -> None:
     print(f"判決 {len(rows)} 筆，其中 {hit} 筆有附表宣告刑，共寫入 {n} 列")
 
 
+EXPORT_COLUMNS = [
+    ("裁判字號", "case_number"), ("裁判日期", "judgment_date"), ("被告", "defendant"),
+    ("法條", "law"), ("罪名", "charge"), ("宣告刑", "sentence"),
+    ("宣告刑（月）", "months"), ("拘役（日）", "days"), ("併科罰金（元）", "fine"),
+    ("附表列號", "row_no"), ("原文", "raw"),
+]
+
+
+def export_excel(path: str) -> int:
+    """把 offenses 表匯出成 Excel（一列一個被告×罪×宣告刑），回傳列數。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    conn = sqlite3.connect(DB_PATH)
+    cols = ", ".join(f"o.{c}" if c != "judgment_date" else "j.judgment_date" for _, c in EXPORT_COLUMNS)
+    rows = conn.execute(
+        f"SELECT {cols} FROM offenses o LEFT JOIN judgments j ON j.crawl_id = o.crawl_id "
+        "ORDER BY j.judgment_date, o.case_number, o.id").fetchall()
+    conn.close()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "附表宣告刑"
+    ws.append([name for name, _ in EXPORT_COLUMNS])
+    for row in rows:
+        ws.append(list(row))
+    for cell in ws[1]:
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.fill = PatternFill("solid", fgColor="1F3864")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col, width in zip("ABCDEFGHIJK", (38, 14, 16, 30, 28, 20, 12, 10, 14, 10, 60)):
+        ws.column_dimensions[col].width = width
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    wb.save(path)
+    return len(rows)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--keyword", default="ADV:TPD:M")
-    build(ap.parse_args().keyword)
+    ap.add_argument("-o", "--output", default="", help="匯出 Excel 檔名")
+    ap.add_argument("--export-only", action="store_true", help="不重建 offenses 表，只匯出現有內容（需搭配 -o）")
+    args = ap.parse_args()
+    if args.export_only and not args.output:
+        ap.error("--export-only 需要搭配 -o 指定輸出檔名")
+    if not args.export_only:
+        build(args.keyword)
+    if args.output:
+        print(f"匯出 {export_excel(args.output)} 列 → {args.output}")
