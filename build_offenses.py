@@ -30,6 +30,7 @@ def build(keyword: str = "ADV:TPD:M") -> None:
             months      INTEGER,
             days        INTEGER,
             fine        INTEGER,
+            fine_type   TEXT,
             raw         TEXT
         );
         CREATE INDEX idx_offenses_case ON offenses(case_number);
@@ -51,9 +52,9 @@ def build(keyword: str = "ADV:TPD:M") -> None:
         for o in offs:
             conn.execute(
                 "INSERT INTO offenses (crawl_id, case_number, table_idx, row_no, defendant, law, charge,"
-                " sentence, months, days, fine, raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " sentence, months, days, fine, fine_type, raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (crawl_id, case_number, o["table"], o["no"], o["defendant"], o["law"], o["charge"],
-                 o["sentence"], o["months"], o["days"], o["fine"], o["raw"]))
+                 o["sentence"], o["months"], o["days"], o["fine"], o["fine_type"], o["raw"]))
             n += 1
     conn.commit()
     conn.close()
@@ -63,7 +64,7 @@ def build(keyword: str = "ADV:TPD:M") -> None:
 EXPORT_COLUMNS = [
     ("裁判字號", "case_number"), ("裁判日期", "judgment_date"), ("被告", "defendant"),
     ("法條", "law"), ("罪名", "charge"), ("宣告刑", "sentence"),
-    ("宣告刑（月）", "months"), ("拘役（日）", "days"), ("併科罰金（元）", "fine"),
+    ("宣告刑（月）", "months"), ("拘役（日）", "days"), ("罰金（元）", "fine"), ("罰金類型", "fine_type"),
     ("附表列號", "row_no"), ("原文", "raw"),
 ]
 
@@ -91,7 +92,7 @@ def export_excel(path: str) -> int:
         cell.fill = PatternFill("solid", fgColor="1F3864")
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    for col, width in zip("ABCDEFGHIJK", (38, 14, 16, 30, 28, 20, 12, 10, 14, 10, 60)):
+    for col, width in zip("ABCDEFGHIJKL", (38, 14, 16, 30, 28, 20, 12, 10, 14, 10, 10, 60)):
         ws.column_dimensions[col].width = width
     for row in ws.iter_rows(min_row=2):
         for cell in row:

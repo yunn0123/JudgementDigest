@@ -15,6 +15,7 @@ _SENT_HEADER = re.compile(r"宣告刑|主文|判處|罪刑")
 _CHARGE_HEADER = re.compile(r"罪名")
 _CHARGE_IN_CELL = re.compile(r"犯([^，。；]{2,60}?罪)")
 _FINE = re.compile(rf"併科罰金(?:新臺幣)?([{NUM},]+)元")
+_MAIN_FINE = re.compile(rf"罰金(?:新臺幣)?([{NUM},]+)元")
 _MARK = re.compile(r"^(?:[⑴-⒛①-⑳㈠-㈩]|[\(（][\d一二三四五六七八九十]+[\)）]|[\dIVXivx]{1,3}[.．、])+")
 _LAW_PREFIX = re.compile(
     rf"^(?P<law>[^，、；。]{{2,25}}?(?:法|條例)第[{NUM}]+條(?:之[{NUM}]+)?(?:第[{NUM}]+項)?"
@@ -116,7 +117,12 @@ def parse_sentence_cell(text: str, charge_hint: str = "", names=()) -> List[Dict
             head = _MARK.sub("", re.sub(r"(?:共同|幫助|教唆)$", "", head)).strip()
             ascii_name = bool(re.fullmatch(r"[A-Za-z .\-·,]+", head))
             who = head if 0 < len(head) <= (40 if ascii_name else 12) else ""
-        fine = _FINE.search(clause[m.end():])
+        if sentence.startswith("罰金"):          # 主刑罰金：金額就在宣告刑本身
+            fm = _MAIN_FINE.match(sentence)
+            fine, fine_type = (_amount(fm.group(1)) if fm else None), "主刑"
+        else:
+            fm = _FINE.search(clause[m.end():])
+            fine, fine_type = (_amount(fm.group(1)) if fm else None), ("併科" if fm else "")
         law = ""
         lm = _LAW_PREFIX.match(charge or "")
         if lm:
@@ -125,7 +131,7 @@ def parse_sentence_cell(text: str, charge_hint: str = "", names=()) -> List[Dict
             "raw": clause,
             "defendant": who, "law": law, "charge": charge, "sentence": sentence,
             "months": _months(sentence), "days": _days(sentence),
-            "fine": _amount(fine.group(1)) if fine else None,
+            "fine": fine, "fine_type": fine_type,
         })
     return out
 
