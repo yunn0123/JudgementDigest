@@ -462,6 +462,29 @@ def _extract_sections_text_pre(text_pre_elem) -> Tuple[Dict[str, str], str, List
 
 
 # ─── Step 3：將正文容器依段落標題切割成 sections ──────────────────────────────
+# 前言收尾句與「主文」標題擠在同一個 div：「…本院判決如下： 主 文」。
+# 不拆開的話「主文」不會被認成標題，主文整段留在前言、verdict 變空
+# （實測臺北地院 2022 年除權判決 45 筆）。
+_INTRO_WITH_HEADING_RE = re.compile(r"^(.+?(?:如下|以下)\s*[：:︰]?)\s*(主\s*文)\s*$")
+
+
+def _section_lines(container):
+    """逐一產生 (class 集合, 文字)；把黏在前言收尾句後面的「主文」拆成獨立一行。"""
+    for child in container.children:
+        if not isinstance(child, Tag) or child.name not in ("div", "p", "td"):
+            continue
+        classes = set(child.get("class") or [])
+        text = _t(child)
+        if not text:
+            continue
+        m = _INTRO_WITH_HEADING_RE.match(text)
+        if m:
+            yield classes, m.group(1)
+            yield set(), m.group(2)
+        else:
+            yield classes, text
+
+
 def _extract_sections(container) -> Tuple[Dict[str, str], str, List[str]]:
     """
     回傳:
@@ -497,17 +520,7 @@ def _extract_sections(container) -> Tuple[Dict[str, str], str, List[str]]:
                 sections[current_title] = content
         current_buf = []
 
-    for child in container.children:
-        if not isinstance(child, Tag):
-            continue
-        if child.name not in ("div", "p", "td"):
-            continue
-
-        classes = set(child.get("class") or [])
-        text = _t(child)
-        if not text:
-            continue
-
+    for classes, text in _section_lines(container):
         full_parts.append(text)
 
         is_heading = (

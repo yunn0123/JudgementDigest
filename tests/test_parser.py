@@ -359,3 +359,24 @@ class TestJianCompoundParties(unittest.TestCase):
                      "受 告知人 臺北市政府工務局水利工程處", "法定代理人 陳郭正"])
         self.assertEqual(r["defendant"], "財政部國有財產署")
         self.assertEqual(r["defendant_agent"], "曾國基")
+
+
+class TestHeadingGluedToIntro(unittest.TestCase):
+    def test_verdict_heading_in_same_div_as_intro(self):
+        """REGRESSION：「本院判決如下： 主 文」同一個 div 時 verdict 全空
+        （臺北地院 2022 年除權判決 45 筆）。"""
+        page = (
+            '<div id="jud"><div class="htmlcontent">'
+            '<div class="he-h1">臺灣臺北地方法院民事判決</div>'
+            '<div>聲 請 人 高瑞霞</div>'
+            '<div>上列聲請人聲請除權判決（股票）事件，本院判決如下：　主　文</div>'
+            '<div>如附表所示之證券無效。</div>'
+            '<div>訴訟費用由聲請人負擔。</div>'
+            '<div class="notEdit">理　由</div>'
+            '<div>一、如附表所示之證券，業經本院公示催告，申報權利期間已屆滿，迄今無人申報權利，'
+            '聲請人聲請除權判決，與法相符，應予准許。二、依民事訴訟法第564條第1項，判決如主文。</div>'
+            '</div></div>'
+        )
+        d = parse_html(page, crawl_id=-1)
+        self.assertIn("證券無效", d["verdict"])
+        self.assertEqual(d["plaintiff"], "高瑞霞")
