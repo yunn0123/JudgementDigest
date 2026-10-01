@@ -30,7 +30,8 @@ import os
 import re
 import argparse
 import logging
-from typing import Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup, Tag, NavigableString
 
@@ -114,17 +115,30 @@ _ROLE_SET: frozenset = frozenset(
 
 # 停止擷取當事人姓名的標記（後面是地址或其他角色）
 _NAME_STOP_RE = re.compile(
-    r"(?:住|設|居|籍|（|\(|訴訟\s*代理|辯護|法定\s*代理|複\s*代理|輔佐|律師)"
+    r"(?:住|設|居|籍|（|\(|訴\s*訟\s*代\s*理|辯護|法\s*定\s*代\s*理|複\s*代\s*理|輔佐|律師)"
 )
 
 # 代理人/辯護人行：匹配角色前綴並捕捉後方姓名（Group 1）
+# 每個字之間都允許空白：前言常把稱謂排成「訴 訟 代理人」「代 理 人」，
+# 只在詞界允許空白的話這種行會被當成當事人姓名。
+_AGENT_ROLES = ("訴訟代理人", "法定代理人", "複代理人", "特別代理人",
+                "送達代收人",          # 兼任送達代收人時另起一行的格式
+                "選任辯護人", "指定辯護人", "辯護人", "代理人")
 _AGENT_RE = re.compile(
-    r"^(?:訴訟\s*代理\s*人|法定\s*代理\s*人|複\s*代理\s*人|特別\s*代理\s*人"
-    r"|送達\s*代收\s*人"          # 兼任送達代收人時另起一行的格式
-    r"|選任\s*辯護\s*人|指定\s*辯護\s*人|辯護\s*人|代\s*理\s*人)\s*(.+)"
+    r"^(?:" + "|".join(r"\s*".join(r) for r in _AGENT_ROLES) + r")\s*(.+)"
 )
-# 其他輔助角色（輔佐人），不提取姓名，直接跳過
-_AUX_SKIP_RE = re.compile(r"^(?:輔佐)")
+# 「兼法定代理人 高景炎」「兼上二人共同訴訟代理人 楊怡軒」：此人同時是
+# 當事人與（上列當事人的）代理人。這段前綴常被斷成獨立一行（「兼」、
+# 「兼法定代理」、「兼 法 定」），要先和下一行接起來再解析。
+_JIAN_PREFIX_RE = re.compile(
+    r"^兼\s*(?:(?:以\s*)?[上前]\s*[〇一二三四五六七八九十\d]+\s*人\s*(?:之\s*)?)?(?:共\s*同\s*)?")
+_AGENT_ROLE_ONLY_RE = re.compile(
+    r"^(?:" + "|".join(r"\s*".join(r) for r in _AGENT_ROLES) + r")\s*$")
+_JIAN_FRAGMENT_RE = re.compile(r"^兼[上前以共同之人〇一二三四五六七八九十\d訴訟法定特別複選任指定代理收送達人辯護\s]*$")
+# 兩造以外的訴訟關係人（輔佐人、參加人、受告知人）。不提取姓名，而且之後的
+# 代理人行與延續行也不能再歸給上一位當事人——舊規則只跳過這一行，
+# 「受告知人 臺北市政府工務局」和它的法定代理人就被記成被告的代理人。
+_AUX_SKIP_RE = re.compile(r"^(?:輔\s*佐|參\s*加\s*人|受\s*告\s*知\s*人)")
 # 地址行識別：以數字或英文開頭
 _ADDR_ONLY_RE = re.compile(r"^[\d\sA-Za-z]")
 # 前言頁尾標記：出現即停止擷取當事人（裁定類文件無段落標題時前言會包含頁尾）
@@ -260,8 +274,15 @@ _ZERO_WIDTH_RE = re.compile(r"[​‌‍⁠﻿]")
 
 
 def _normalize_section_title(text: str) -> str:
-    """移除空白與零寬字元，取得純標題文字。例：'主　文' → '主文'"""
-    return _SPACES.sub("", _ZERO_WIDTH_RE.sub("", text).strip())
+    """
+    移除空白、零寬字元與結尾標點，取得純標題文字。例：'主　文' → '主文'
+
+    結尾標點：少數判決把標題寫成「事 實 及 理 由、」「理由要領。」，
+    不去掉的話段落存在 sections["事實及理由、"]，下游用「事實及理由」取不到，
+    整份判決的事實與理由欄位變成空的。
+    """
+    title = _SPACES.sub("", _ZERO_WIDTH_RE.sub("", text).strip())
+    return title.rstrip("、。：:，,")
 
 
 # 下游真正會取用的段落標題（見 parse_html 的 sections.get(...)）。
@@ -347,6 +368,20 @@ def _find_content_container(soup: BeautifulSoup):
             return elem
     # soup.body 可能為 None（頁面未完整載入），回傳空的 Tag 讓呼叫端優雅降級
     return soup.body or BeautifulSoup("<div></div>", "lxml").div
+
+
+# 正文裡只負責排版的行內標籤。司法院把法律名詞包成 <abbr class="termhover">
+# （滑鼠移上去顯示名詞解釋），幾乎每份裁判書都有；_t() 以空格串接文字節點，
+# 不先拆掉的話「被告<abbr>應</abbr>將」會變成「被告 應將」，主文規則與金額
+# 抽取都得容忍任意空格。實測樣本 99% 以上的主文受影響。
+_INLINE_TAGS = ("abbr", "span", "a", "u", "b", "i", "em", "strong", "font", "o:p")
+
+
+def _flatten_inline_tags(container) -> None:
+    """拆掉行內排版標籤並合併相鄰文字節點，讓 get_text(" ") 不在詞中插空格。"""
+    for tag in container.find_all(_INLINE_TAGS):
+        tag.unwrap()
+    container.smooth()
 
 
 # ─── Step 3a：text-pre 格式（憲法法庭等）的段落切割 ──────────────────────────
@@ -668,6 +703,7 @@ def _extract_parties(preamble_lines: List[str]) -> Dict[str, str]:
                 return field, role, ""
         return None
 
+    jian_pending = ""   # 被斷行的「兼…」前綴，等下一行接上
     for line in preamble_lines:
         collapsed = _SPACES.sub(" ", line).strip()
         if not collapsed:
@@ -676,6 +712,35 @@ def _extract_parties(preamble_lines: List[str]) -> Dict[str, str]:
         # 0. 頁尾標記：停止處理（裁定類文件前言可能包含頁尾）
         if _PREAMBLE_STOP_RE.search(collapsed):
             break
+
+        # 0.5 「兼…代理人 姓名」：姓名同時記為當事人與代理人
+        if jian_pending:
+            # 已經是完整稱謂（「兼送達代收人」）而下一行另起角色時，它是上一行
+            # 那位代理人的附註，不是下一行的前綴——接起來會把下一行的姓名吃掉
+            if (_AGENT_ROLE_ONLY_RE.match(_JIAN_PREFIX_RE.sub("", jian_pending))
+                    and (_AGENT_RE.match(collapsed) or _match_role(collapsed))):
+                jian_pending = ""
+            else:
+                collapsed = jian_pending + collapsed
+                jian_pending = ""
+        if collapsed.startswith("兼"):
+            if _JIAN_FRAGMENT_RE.match(collapsed):
+                jian_pending = re.sub(r"\s", "", collapsed)
+                continue
+            rest = _JIAN_PREFIX_RE.sub("", collapsed)
+            agent_m = _AGENT_RE.match(rest)
+            if agent_m and current_field:
+                # 兼任送達代收人的是代理人本人，不是當事人
+                if not re.match(r"送\s*達\s*代\s*收\s*人", rest):
+                    _add_name(current_field, agent_m.group(1), check_len=True)
+                _add_agent(current_field, agent_m.group(1))
+                in_agent_context = True
+                continue
+
+        # 0.6 稱謂單獨一行（「代 理 人」，姓名在下一行）：不是當事人姓名
+        if _AGENT_ROLE_ONLY_RE.match(collapsed):
+            in_agent_context = True
+            continue
 
         has_ji = collapsed.startswith("即")
         ji_stripped = re.sub(r"^即\s*", "", collapsed) if has_ji else collapsed
@@ -704,7 +769,7 @@ def _extract_parties(preamble_lines: List[str]) -> Dict[str, str]:
         # 2. 跳過組別標記（「上三人」、「上 三 人」、「上列」、「前列」、「共 同」等）
         if re.match(
             r"^(?:"
-            r"[上前]\s*(?:[〇一二三四五六七八九十百千萬]+\s*人|列)"  # 上三人 / 前列
+            r"(?:以\s*)?[上前]\s*(?:[〇一二三四五六七八九十百千萬\d]+\s*人|列)"  # 上三人 / 上3人 / 前列
             r"|共\s*同"                                               # 共 同
             r")",
             collapsed,
@@ -719,8 +784,10 @@ def _extract_parties(preamble_lines: List[str]) -> Dict[str, str]:
             in_agent_context = True
             continue
 
-        # 4. 其他輔助角色行（輔佐人等）→ 跳過
+        # 4. 兩造以外的關係人（輔佐人、參加人、受告知人）→ 跳過，直到下一個當事人角色
         if _AUX_SKIP_RE.match(collapsed):
+            current_field = ""
+            in_agent_context = False
             continue
 
         # 5. 跳過地址行（數字/英文開頭）
@@ -757,15 +824,6 @@ _LAW_APPENDIX_RE = re.compile(
     r"(?:附錄(?:本案)?(?:論罪科刑)?法條(?:全文)?|所犯法條)\s*[：:]\s*"
     r"(?!分敘)",          # 排除「所犯法條分敘如下」（那是正文，不是附錄）
 )
-# 「據上論斷，依 ... 判決如主文」中的條文引用
-# (.{1,300}?) 限制長度，避免從段落中間的「依」一路撐到文末的「判決如主文」而抓到無關內容
-_YIJU_RE = re.compile(r"依\s*(.{1,300}?)\s*[,，]\s*(?:判決|裁定)如主文", re.DOTALL)
-# 條文引用：「刑法第339條之4」「民法第148條」「刑事訴訟法第101條第1項」等
-# {1,15} 允許單字法律名（民法、刑法），避免 {2,15} 造成多字詞前綴（如「惟依民法」）被誤抓
-_LAW_CITE_RE = re.compile(
-    r"(?:[^\s，；、（\(]{1,15}(?:法|條例|規則))"
-    r"\s*第\s*[\d百千一二三四五六七八九十]+\s*條[之第\d\s]*"
-)
 
 
 def _extract_laws(soup: BeautifulSoup, sections: Dict[str, str], full_text: str = "") -> str:
@@ -786,14 +844,38 @@ def _extract_laws(soup: BeautifulSoup, sections: Dict[str, str], full_text: str 
     for src in candidates:
         if not src:
             continue
-        # 找 "依...判決如主文" 子句
-        m = _YIJU_RE.search(src[-3000:])   # 只搜結尾部分，效率較高
-        if m:
-            cited = _LAW_CITE_RE.findall(m.group(1))
-            if cited:
-                return "；".join(dict.fromkeys(cited))[:1000]
+        cited = _cited_clause(src[-3000:])   # 只搜結尾部分，效率較高
+        if cited:
+            return cited[:1000]
 
     return ""
+
+
+# 「…依民事訴訟法第79條、第390條第2項，判決如主文」的結尾
+_JUDGE_AS_VERDICT_RE = re.compile(r"[,，]\s*(?:爰)?(?:判決|裁定)如主文")
+_HAS_ARTICLE_RE = re.compile(r"第[\d百千一二三四五六七八九十〇零]+條")
+
+
+def _cited_clause(text: str) -> str:
+    """
+    取「判決如主文」前最後一個「依」之後的條文引用原句。
+
+    取最後一個「依」而非第一個：從第一個「依」起算會吞進前面好幾句論理
+    （「應依職權宣告假執行…七、依民事訴訟法第79條」）。原句保留項、款、
+    前段、但書，也保留「第79條、第390條」這種承前省略法律名稱的寫法，
+    不再用 regex 逐條切——那會把「第1項」切成「第1」、把跨行的
+    「依民\\n事訴訟法」切成「事訴訟法」。
+    """
+    ends = list(_JUDGE_AS_VERDICT_RE.finditer(text))
+    if not ends:
+        return ""
+    head = text[max(0, ends[-1].start() - 300):ends[-1].start()]
+    i = head.rfind("依")
+    if i < 0:
+        return ""
+    clause = re.sub(r"\s+", "", head[i + 1:])
+    clause = re.sub(r"(?:等)?(?:規定|之規定)$", "", clause)
+    return clause if _HAS_ARTICLE_RE.search(clause) else ""
 
 
 # ─── Step 6：法官 / 書記官擷取 ───────────────────────────────────────────────
@@ -807,6 +889,25 @@ _CJK_NAME_RE = r"([一-鿿](?:[^\S\n]*[一-鿿]){1,5})"
 _NAME_TAIL_NOISE_RE = re.compile(
     r"(?:以上|附表|附件|附錄|正本|如不|書記|係照|據上|所犯|中華)"
 )
+
+
+# 簽名行很短（「民事第四庭 法 官 王伯文」），論理段落的行動輒上百字
+_SIGNATURE_LINE_MAX = 30
+
+
+def _is_signature_match(text: str, m: re.Match) -> bool:
+    """
+    「法官／書記官」後面緊接姓名、中間沒有空白時，只在短行（簽名行）上採信。
+
+    頁面把職稱與姓名放在不同的 <span>，拆掉行內標籤後會變成「法 官王伯文」；
+    但論理裡的「法官認為…」也長這樣，用行長區分兩者。
+    """
+    if re.search(r"官\s", m.group(0)):
+        return True
+    start = text.rfind("\n", 0, m.start()) + 1
+    end = text.find("\n", m.end())
+    end = len(text) if end < 0 else end
+    return end - start <= _SIGNATURE_LINE_MAX
 
 
 def _clean_cjk_name(raw: str) -> str:
@@ -828,9 +929,9 @@ def _extract_judges_and_clerk(full_text: str) -> Tuple[str, str]:
        避免抓到 HTML 末尾嵌入起訴書或正本認證章的書記官。
     """
     # 在全文找所有法官 pattern（不限尾端窗口大小）
-    all_matches = list(re.finditer(
-        rf"(?:審判長\s*)?法\s*官\s+{_CJK_NAME_RE}", full_text
-    ))
+    all_matches = [m for m in re.finditer(
+        rf"(?:審判長\s*)?法\s*官\s*{_CJK_NAME_RE}", full_text
+    ) if _is_signature_match(full_text, m)]
 
     # 過濾假名（獨任、審理…）
     valid = [(m, _clean_cjk_name(m.group(1))) for m in all_matches]
@@ -855,7 +956,8 @@ def _extract_judges_and_clerk(full_text: str) -> Tuple[str, str]:
 
     # 書記官：在最後一位法官起算 600 字內搜尋
     clerk_window = full_text[sig_pos : sig_pos + 600]
-    cm = re.search(rf"書\s*記\s*官\s+{_CJK_NAME_RE}", clerk_window)
+    cm = next((m for m in re.finditer(rf"書\s*記\s*官\s*{_CJK_NAME_RE}", clerk_window)
+               if _is_signature_match(clerk_window, m)), None)
     if cm:
         n = _clean_cjk_name(cm.group(1))
         clerk = n if 1 <= len(n) <= 6 else ""
@@ -906,6 +1008,7 @@ def parse_html(
 
     # 2. 正文容器
     container = _find_content_container(soup)
+    _flatten_inline_tags(container)
 
     # 3. 段落切割
     sections, full_text, preamble = _extract_sections(container)
@@ -997,17 +1100,21 @@ _BASE_INSERT_COLUMNS = [
 ]
 
 
+def _write_judgment(conn: sqlite3.Connection, data: Dict) -> None:
+    """寫入一筆解析結果並標記 parsed=1；不 commit，由呼叫端決定交易邊界。"""
+    cols = _BASE_INSERT_COLUMNS + [col for col, _ in STRUCTURED_COLUMNS]
+    placeholders = ",".join("?" * len(cols))
+    conn.execute(
+        f"INSERT OR REPLACE INTO judgments ({','.join(cols)}) VALUES ({placeholders})",
+        tuple(data.get(col) for col in cols),
+    )
+    conn.execute("UPDATE crawl_records SET parsed=1 WHERE id=?", (data["crawl_id"],))
+
+
 def save_judgment(data: Dict) -> bool:
     conn = sqlite3.connect(DB_PATH)
-    c    = conn.cursor()
     try:
-        cols = _BASE_INSERT_COLUMNS + [col for col, _ in STRUCTURED_COLUMNS]
-        placeholders = ",".join("?" * len(cols))
-        c.execute(
-            f"INSERT OR REPLACE INTO judgments ({','.join(cols)}) VALUES ({placeholders})",
-            tuple(data.get(col) for col in cols),
-        )
-        c.execute("UPDATE crawl_records SET parsed=1 WHERE id=?", (data["crawl_id"],))
+        _write_judgment(conn, data)
         conn.commit()
         logger.info("  Parsed → %s", data["case_number"])
         return True
@@ -1020,6 +1127,21 @@ def save_judgment(data: Dict) -> bool:
 
 
 # ─── 批次解析（將 parsed=0 的紀錄全部處理） ───────────────────────────────────
+# 每批 commit 的筆數。逐筆 commit 時寫入開銷是解析本身的兩倍以上；
+# 中斷時最多重做一批，因為未 commit 的列 parsed 旗標也還是 0。
+_COMMIT_EVERY = 200
+# 並行讀檔的執行緒數。Windows 上第一次開啟 html_cache 的檔案每個約 150 ms
+# （解析本身只要 ~25 ms），延遲來自開檔而非 CPU，以執行緒並行可降到 ~20 ms。
+_READ_THREADS = 8
+
+
+def _read_html(html_file: str) -> Optional[str]:
+    if not html_file or not os.path.exists(html_file):
+        return None
+    with open(html_file, encoding="utf-8") as f:
+        return f.read()
+
+
 def parse_all_unparsed() -> int:
     init_db()
     conn  = sqlite3.connect(DB_PATH)
@@ -1027,33 +1149,60 @@ def parse_all_unparsed() -> int:
         "SELECT id, case_number, court, judgment_date, html_file, keyword, source_url "
         "FROM crawl_records WHERE parsed=0"
     ).fetchall()
-    conn.close()
 
     logger.info("Unparsed records: %d", len(rows))
     success = 0
 
-    for crawl_id, case_number, court, jdate, html_file, keyword, source_url in rows:
-        if not html_file or not os.path.exists(html_file):
-            logger.warning("  HTML not found: %s", html_file)
-            continue
-        try:
-            with open(html_file, encoding="utf-8") as f:
-                html = f.read()
-            data = parse_html(
-                html, crawl_id,
-                keyword=keyword or "",
-                case_number_hint=case_number or "",
-                court_hint=court or "",
-                date_hint=jdate or "",
-                source_url=source_url or "",
-            )
-            if save_judgment(data):
-                success += 1
-        except Exception as exc:
-            logger.error("  Error parsing %s: %s", html_file, exc, exc_info=True)
+    # 手動管理交易：預設模式下 SAVEPOINT 若是最外層，RELEASE 就會直接
+    # commit，批次形同虛設
+    conn.isolation_level = None
+    try:
+        with ThreadPoolExecutor(max_workers=_READ_THREADS) as pool:
+            for start in range(0, len(rows), _COMMIT_EVERY):
+                batch = rows[start:start + _COMMIT_EVERY]
+                htmls = pool.map(_read_html, [r[4] for r in batch])
+                conn.execute("BEGIN")
+                for row, html in zip(batch, htmls):
+                    if _parse_and_write(conn, row, html):
+                        success += 1
+                conn.execute("COMMIT")
+                logger.info("Progress: %d / %d", start + len(batch), len(rows))
+    finally:
+        conn.close()
 
     logger.info("Parsing complete: %d / %d", success, len(rows))
     return success
+
+
+def _parse_and_write(conn: sqlite3.Connection, row: tuple, html: Optional[str]) -> bool:
+    crawl_id, case_number, court, jdate, html_file, keyword, source_url = row
+    if html is None:
+        logger.warning("  HTML not found: %s", html_file)
+        return False
+    try:
+        data = parse_html(
+            html, crawl_id,
+            keyword=keyword or "",
+            case_number_hint=case_number or "",
+            court_hint=court or "",
+            date_hint=jdate or "",
+            source_url=source_url or "",
+        )
+    except Exception as exc:
+        logger.error("  Error parsing %s: %s", html_file, exc, exc_info=True)
+        return False
+    # 單筆寫入失敗只撤回這一筆，不連累同一批已寫入的其他列
+    conn.execute("SAVEPOINT one")
+    try:
+        _write_judgment(conn, data)
+    except Exception as exc:
+        conn.execute("ROLLBACK TO one")
+        conn.execute("RELEASE one")
+        logger.error("  DB error: %s", exc)
+        return False
+    conn.execute("RELEASE one")
+    logger.info("  Parsed → %s", data["case_number"])
+    return True
 
 
 # ─── 重新解析已解析過的紀錄 ───────────────────────────────────────────────────
