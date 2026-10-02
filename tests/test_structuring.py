@@ -148,6 +148,17 @@ class TestCaseKind(unittest.TestCase):
         self.assertEqual(S.case_kind_category("重訴更二"), "給付確認")
         self.assertEqual(S.case_kind_category("勞訴更一"), "給付確認")
 
+    def test_judicial_officer_matters_are_non_adversarial(self):
+        # 司法事務官的程序事項（確定訴訟費用額、命繳訴訟費用）網站上有時
+        # 標成「民事判決」，主文「相對人應給付…訴訟費用額」不是勝訴
+        for kind in ("司聲", "司他", "司家他", "司家聲", "司"):
+            self.assertEqual(S.case_kind_category(kind), "非對審", kind)
+        row = {"case_number": "臺灣新北地方法院 113 年度司聲字第 918 號民事判決",
+               "verdict": "相對人應給付聲請人之訴訟費用額確定為新臺幣參萬元。"}
+        r = S.derive_structured_fields(row)
+        self.assertEqual(r["outcome"], "")
+        self.assertNotIn("無法官", r["quality_flags"].split("|"))
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 class TestOutcome(unittest.TestCase):
@@ -156,6 +167,34 @@ class TestOutcome(unittest.TestCase):
     def test_full_win(self):
         v = "被告應給付原告新臺幣100萬元。訴訟費用由被告負擔。"
         self.assertEqual(S.classify_outcome(v)["outcome"], S.WIN)
+
+    def test_partition_wordings_from_other_courts(self):
+        # 士林／新北常見的分割寫法，舊規則全部落入「其他/不明確」
+        for v in ("兩造共有如附表所示之不動產分歸被告取得，被告並應補償原告新臺幣參佰萬元。",
+                  "兩造共有坐落臺北市○○區○○段土地，應以如附圖一所示之方式分割。",
+                  "兩造共有如附表一所示不動產合併分割，由原告分得編號1所示不動產。"):
+            self.assertEqual(S.classify_outcome(v)["outcome"], S.PARTITION, v)
+
+    def test_formative_and_injunctive_grants(self):
+        for v in ("被告應自門牌號碼新北市○○區○○路○號房屋遷離。訴訟費用由被告負擔。",
+                  "被告甲擔任被告乙公司之董事職務，應予解任。",
+                  "被告於民國一一一年召開之股東臨時會議所為決議均予撤銷。",
+                  "被告應將保險契約之要保人變更為原告。",
+                  "被告應將會計帳簿供原告查閱、抄錄或複製。"):
+            self.assertEqual(S.classify_outcome(v)["outcome"], S.WIN, v)
+
+    def test_injunction_with_rest_dismissed_is_partial(self):
+        v = "被告不得妨害原告通往頂樓平臺。原告其餘之訴駁回。"
+        self.assertEqual(S.classify_outcome(v)["outcome"], S.PARTIAL)
+
+    def test_dismissed_annulment_is_not_a_grant(self):
+        v = "原告請求確認決議無效之訴駁回。訴訟費用由原告負擔。"
+        self.assertEqual(S.classify_outcome(v)["outcome"], S.LOSE)
+
+    def test_change_in_reasoning_is_not_a_grant(self):
+        # 「不容任意變更」不是給付判項（補繳裁判費裁定被誤判成勝訴）
+        v = "其訴訟標的之價額仍應以前訴訟程序所核定者為準，不容任意變更。限再審原告於五日內補繳。"
+        self.assertNotEqual(S.classify_outcome(v)["outcome"], S.WIN)
 
     def test_full_loss(self):
         self.assertEqual(
@@ -306,6 +345,17 @@ class TestAmounts(unittest.TestCase):
         v = ("被告應給付原告新臺幣100萬元。訴訟費用由被告負擔。"
              "本判決第一項於原告以新臺幣35萬元為被告供擔保後，得假執行。")
         self.assertEqual(S.extract_awarded_amounts(v)["awarded_total"], 1000000)
+
+    def test_missing_period_before_cost_line(self):
+        """REGRESSION：判項漏打句號、直接換行接「訴訟費用由…」時，兩行
+        併成一句會被訴訟費用排除規則整句丟掉（新北 112 訴 304 實測）。"""
+        v = "被告應給付原告新臺幣75萬7,436元\n訴訟費用（除減縮部分外）由被告負擔。"
+        self.assertEqual(S.extract_awarded_amounts(v)["awarded_total"], 757436)
+
+    def test_mid_sentence_line_break_is_not_split(self):
+        # 句子中間的斷行不能切：「…參拾捌元⏎為原告預供擔保」
+        v = "被告應給付原告新臺幣壹萬元。\n本判決得假執行，但被告以新臺幣壹萬元\n為原告預供擔保，得免為假執行。"
+        self.assertEqual(S.extract_awarded_amounts(v)["awarded_total"], 10000)
 
     def test_multiple_items_are_summed(self):
         """REGRESSION：多筆給付只抓第一筆會系統性低估（實測 14.2% 案件受影響）。"""
@@ -474,6 +524,17 @@ class TestReliefType(unittest.TestCase):
     def test_partition(self):
         self.assertIn("形成（分割）",
                       S.extract_relief_type("兩造共有如附表所示之不動產，應予變賣。"))
+
+    def test_non_money_win_is_not_extraction_failure(self):
+        """REGRESSION：「非金錢給付」字串含「金錢給付」，子字串比對會讓
+        純塗銷登記的勝訴案件被標成「金額抽取失敗」（士林 2022 實測）。"""
+        row = {"verdict": "被告應將如附表所示最高限額抵押權登記塗銷。訴訟費用由被告負擔。",
+               "case_number": "臺灣士林地方法院 111 年度訴字第 1 號民事判決"}
+        r = S.derive_structured_fields(row)
+        self.assertEqual(r["relief_type"], "非金錢給付")
+        flags = r["quality_flags"].split("|")
+        self.assertIn("非金錢給付", flags)
+        self.assertNotIn("金額抽取失敗", flags)
 
 
 class TestCostShare(unittest.TestCase):
