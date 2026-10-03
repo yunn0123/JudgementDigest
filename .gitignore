@@ -32,9 +32,6 @@ update_pptx.py
 # 測試 fixture 不受上面 *_page.html 規則影響
 !tests/fixtures/*.html
 
-# 報告書與其產出（4 MB 圖檔，可由 docs/ 內的腳本重新產生，不入版控）
-docs/
-
 # PR 描述草稿（只給自己貼到 GitHub 用）
 pr_body.md
 
