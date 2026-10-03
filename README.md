@@ -272,18 +272,22 @@ python browse_db.py -p 8002    # 其餘參數原樣轉交給 datasette（此例�
 ```
 
 - **網頁是唯讀的**，無法透過它修改資料。
-- **啟動時會替 `court`、`judgment_type`、`case_kind_category`、`outcome`、
+- **啟動時會替 `court`、`judgment_type`、`case_type`、`case_kind_category`、
   `judgment_date` 建立索引**（已存在就跳過，第一次約 10 秒，資料庫約增加 8 MB）。
   這幾個欄位排在 `full_text` 之後，沒有索引時每次統計都要讀過整個資料庫，
   表格頁要 8–16 秒；有索引後約 0.2 秒。索引不改動任何資料。
 - 另外放寬 Datasette 預設的查詢時間上限（單一查詢 10 秒、分面 5 秒），
   並關閉「建議分面」功能（它會對每個欄位各掃一次整張表）。
-- 版面設定在 `datasette_metadata.yml`：`judgments` 表預設依裁判日期由新到舊排序，
-  並顯示法院、裁判種類、案件類型（`case_kind_category`）、勝敗（`outcome`）的分面；
-  另有兩個預存查詢：
-  - **結構化欄位（不含判決內文）**：只列分析常用欄位，可輸入法院做部分比對
-  - **各法院勝敗分布（給付確認類）**
+- 版面設定在 `datasette_metadata.yml`，民事與刑事資料庫都適用：`judgments` 表預設依
+  裁判日期由新到舊排序，並顯示法院、裁判種類、案由（`case_type`）的分面。另有兩個
+  民事用的預存查詢：
+  - **民事：結構化欄位（不含判決內文）**：只列民事分析常用欄位，可輸入法院做部分比對
+  - **民事：各法院勝敗分布（給付確認類）**
 - 列表頁的長文字欄位只顯示前 300 字，點進單筆資料可看完整內容。
+- **各資料表與欄位的說明見 [docs/欄位說明.md](docs/欄位說明.md)**（每個欄位是什麼、怎麼來的、
+  為什麼需要，並標出哪些是民事專用）。Datasette 網頁上只放簡短說明。
+- `requirements.txt` 限制 Datasette 低於 1.0：1.0 把分面、預存查詢等設定從
+  metadata 移到另一個設定檔，`datasette_metadata.yml` 需要改寫才能沿用。
 
 ---
 
@@ -358,9 +362,12 @@ python crawler.py --recrawl-stubs
 ├── appendix_parser.py   # 刑事判決附表解析（被告、罪名、宣告刑）
 ├── build_offenses.py    # 由附表建立 offenses 表並匯出 Excel
 ├── structure_tasks.py   # 刑事罪法刑結構化（讀 Excel、一案一列）
-├── structure.md         # structure_tasks.py 的欄位與規則說明
 ├── merge.py             # 合併多個匯出 Excel 的一次性小工具（檔名寫死）
 ├── requirements.txt
+│
+├── docs/                # 說明文件
+│   ├── 欄位說明.md      # 各資料表與欄位的說明（民事／刑事）
+│   └── structure.md     # structure_tasks.py 的罪名、法條、刑期萃取規則
 │
 ├── judge_analysis/      # 法官資料分析（獨立於爬蟲，見其 README）
 │   ├── run_analysis.py
@@ -446,7 +453,7 @@ crawl_batched.py
 | `judgments` | 解析結果（原始欄位 30 欄＋結構化欄位 35 欄，另有記錄規則版本的 `structuring_version`） |
 | `offenses` | 刑事判決附表的「被告 × 罪 × 宣告刑」，由 `build_offenses.py` 建立（沒執行過就不存在） |
 
-`browse_db.py` 會在 `judgments` 上建立 5 個 `idx_judgments_*` 索引（見上方
+`browse_db.py` 會在 `judgments` 上建立 `idx_judgments_*` 索引（見上方
 「瀏覽資料庫」），`html_parser.py --reparse` 清空重建資料時索引會保留。
 
 ### 支援的解析欄位
@@ -459,8 +466,8 @@ crawl_batched.py
 
 `structuring.py` 在解析當下從既有文字欄位推導出 35 個結構化欄位，涵蓋
 案件分類、訴訟結果（本訴／反訴分離）、判准與請求金額、結構化法條引用、
-法官與角色、當事人與程序特徵。完整欄位字典見
-[judge_analysis/README.md](judge_analysis/README.md)。
+法官與角色、當事人與程序特徵。逐欄說明與使用注意事項見 [docs/欄位說明.md](docs/欄位說明.md)。
+這套規則是為民事判決設計的；刑事判決也會套用，但結果沒有意義，分析刑事時請忽略。
 
 三個設計重點：
 
@@ -635,6 +642,7 @@ python build_offenses.py --export-only -o offenses.xlsx   # 不重建，只匯�
 
 從 `export_excel.py` 匯出的 Excel 讀「裁判書資料」分頁，一案一列輸出「罪法刑結構化」分頁
 （罪名／法條／總執行刑／萃取狀態）。跟 `offenses` 表不同：這裡不分被告，多被告案件只取整體結果。
+萃取規則見 [docs/structure.md](docs/structure.md)。
 
 ```bash
 python structure_tasks.py <輸入.xlsx> -o <輸出.xlsx>

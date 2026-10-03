@@ -27,7 +27,7 @@ SETTINGS = {
 # 分面與預設排序用到的欄位。這些欄位排在 full_text 之後，沒有索引時每次統計
 # 都要讀過整個 2 GB 的檔案（表格頁約 8 秒）；有索引後只讀索引本身。
 # 索引只加快查詢、不改動任何資料；html_parser.py --reparse 清空重建時也會保留。
-INDEXED_COLUMNS = ("court", "judgment_type", "case_kind_category", "outcome", "judgment_date")
+INDEXED_COLUMNS = ("court", "judgment_type", "case_type", "case_kind_category", "judgment_date")
 
 
 def ensure_indexes(db_path: str) -> None:
