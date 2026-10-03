@@ -35,10 +35,6 @@ update_pptx.py
 # PR 描述草稿（只給自己貼到 GitHub 用）
 pr_body.md
 
-# 分析產出（可由程式重新產生，不入版控）
-judge_analysis/output/
-judge_analysis/slides/*.png
-
 # 逐月爬取的進度狀態檔（本機執行紀錄）
 crawl_state_*.json
 crawl_state_*.json.tmp

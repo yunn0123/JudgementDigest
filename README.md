@@ -367,12 +367,8 @@ python crawler.py --recrawl-stubs
 │
 ├── docs/                # 說明文件
 │   ├── 欄位說明.md      # 各資料表與欄位的說明（民事／刑事）
-│   └── structure.md     # structure_tasks.py 的罪名、法條、刑期萃取規則
-│
-├── judge_analysis/      # 法官資料分析（獨立於爬蟲，見其 README）
-│   ├── run_analysis.py
-│   ├── src/             # loader.py（資料攤平）、metrics.py（指標與檢定）
-│   └── output/          # 產出（不入版控）
+│   ├── structure.md     # structure_tasks.py 的罪名、法條、刑期萃取規則
+│   └── 心證層欄位規格.md # 爭點、證據、心證強度欄位的規格（尚未實作，交接用）
 │
 ├── tests/               # 離線測試（unittest）＋ 線上煙霧測試
 │   ├── fixtures/        # 測試用的真實裁判書 HTML 樣本
@@ -490,26 +486,6 @@ python backfill_structured.py --no-backup        # 略過資料庫備份（不�
 
 `--court`（法院名稱部分比對）與 `--year`（裁判日期的西元年）都不給時處理全庫。
 備份是整個資料庫檔案的複本，目前約 2 GB，執行前請確認磁碟空間。
-
-### 法官資料分析
-
-回填完成後即可產生法官層級的報表：
-
-```bash
-python judge_analysis/run_analysis.py                                  # 預設：臺北地院 2025 年
-python judge_analysis/run_analysis.py --court 臺中地方法院 --year 2024
-python judge_analysis/run_analysis.py --court 新北 --year ""           # 新北地院全部年份
-python judge_analysis/run_analysis.py --min-cases 30   # 納入統計檢定的最低案件數
-```
-
-**預設只分析臺北地院 2025 年的民事判決**（`--court` 預設 `臺北地方法院`、
-`--year` 預設 `2025`）。`--court` 為部分比對，`--year` 比對裁判日期開頭，
-給空字串即不限。
-
-方法論與完整欄位字典見 [judge_analysis/README.md](judge_analysis/README.md)。
-重點是**不能直接比較法官的原始勝訴率**：案件組合不同會把分派差異誤讀成
-心證傾向，因此報表算的是依案由大類調整後的差異，並以 Benjamini–Hochberg
-控制多重比較的偽發現率。
 
 > ⚠ 使用 `grant_ratio`（獲償比例）前務必先看 `claimed_source`。
 > 值為「主文回推」的列，請求金額是用判准金額代入的，比例恆為 100%，
