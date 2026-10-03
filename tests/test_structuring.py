@@ -15,6 +15,7 @@ structuring.py 的離線測試。
 迭代出來的；沒有回歸測試的話，修 A 打破 B 不會有人發現，而資料缺漏是靜默的。
 """
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -1269,3 +1270,124 @@ class TestSourceColumnsComplete(unittest.TestCase):
     def test_backfill_uses_the_same_list(self):
         import backfill_structured as B
         self.assertEqual(B._SOURCE_COLUMNS, ["id"] + S.SOURCE_COLUMNS)
+
+
+class TestReasoningSections(unittest.TestCase):
+    """理由段落切分：主張段落絕不能混入法院判斷，否則文字模型等於讀到答案。"""
+
+    CONTESTED = ("壹、程序方面：按訴狀送達後，原告不得將原訴變更，但減縮應受判決事項之聲明者，不在此限。"
+                 "貳、實體方面：一、原告主張：被告向原告借款50萬元未還。並聲明：被告應給付原告50萬元。"
+                 "二、被告則以：該款項係贈與，並非借款等語，資為抗辯。並聲明：原告之訴駁回。"
+                 "三、本件原告主張借款之事實，為被告所否認，經查，原告提出之借據堪信為真，"
+                 "原告之請求為有理由。")
+
+    def test_contested_judgment(self):
+        r = S.split_reasoning_sections(self.CONTESTED, "", "")
+        self.assertEqual(r["section_split_status"], "成功")
+        self.assertTrue(r["plaintiff_claim_text"].startswith("原告主張"))
+        self.assertTrue(r["defendant_defense_text"].startswith("被告則以"))
+        self.assertTrue(r["court_reasoning_text"].startswith("三、本件原告主張"))
+
+    def test_no_court_wording_leaks_into_party_sections(self):
+        """REGRESSION：判斷段落以「三、本件原告主張…」開頭、沒有「本院之判斷」時，
+        只靠標記會把整段判斷算進原告主張。"""
+        r = S.split_reasoning_sections(self.CONTESTED, "", "")
+        parties = r["plaintiff_claim_text"] + r["defendant_defense_text"]
+        self.assertNotIn("為有理由", parties)
+        self.assertNotIn("堪信", parties)
+
+    def test_default_judgment(self):
+        text = ("一、原告主張：被告積欠信用卡帳款10萬元。並聲明：被告應給付原告10萬元。"
+                "二、被告未於言詞辯論期日到場，亦未提出書狀作何聲明或陳述。"
+                "三、本院之判斷：原告主張之事實，業據提出信用卡申請書為證，堪信為真實。")
+        r = S.split_reasoning_sections(text, "", "")
+        self.assertEqual(r["section_split_status"], "成功")
+        self.assertTrue(r["defendant_defense_text"].startswith("被告未於言詞辯論期日到場"))
+        self.assertTrue(r["court_reasoning_text"].startswith("三、本院之判斷"))
+        self.assertFalse(r["defendant_defense_text"].endswith("三、"), "段落編號要歸到判斷段")
+
+    def test_no_court_marker_leaves_all_empty(self):
+        """切不出判斷段落時寧可全部留空，不給出可能混入判斷的主張段落。"""
+        r = S.split_reasoning_sections("原告主張：被告應返還借款。被告亦不爭執。", "", "")
+        self.assertEqual(r["section_split_status"], "無法院判斷標記")
+        self.assertEqual(r["plaintiff_claim_text"], "")
+
+    def test_old_style_facts_and_reasons(self):
+        r = S.split_reasoning_sections("", "甲、原告方面：聲明被告應給付10萬元。乙、被告方面：聲明駁回。",
+                                       "按當事人主張有利於己之事實者，就其事實有舉證之責任。")
+        self.assertEqual(r["section_split_status"], "成功")
+        self.assertTrue(r["court_reasoning_text"].startswith("按當事人"))
+
+    def test_only_civil_first_instance_is_split(self):
+        row = dict(TestDeriveStructuredFields.BASE, facts_and_reasons=self.CONTESTED)
+        self.assertEqual(S.derive_structured_fields(row)["section_split_status"], "成功")
+        appeal = dict(row, case_number="臺灣高等法院 112 年度 上 字第 1 號民事判決")
+        self.assertEqual(S.derive_structured_fields(appeal)["section_split_status"], "")
+
+
+class TestClaimBasis(unittest.TestCase):
+    """請求權基礎：只從原告主張抽取，並排除利息、連帶等附帶條文。"""
+
+    def test_article_and_auxiliary_exclusion(self):
+        t = ("原告主張：被告駕車過失撞傷原告。爰依民法第184條第1項前段、第191條之2、"
+             "第195條第1項、第229條第2項、第233條第1項規定，請求被告賠償。")
+        b = S.extract_claim_basis(t)
+        arts = json.loads(b["claim_basis_json"])["articles"]
+        self.assertEqual(b["claim_basis_primary"], "民法§184")
+        self.assertEqual(b["claim_basis_group"], "侵權行為")
+        self.assertIn("民法§191之2", arts)
+        self.assertFalse(any(a.startswith(("民法§229", "民法§233")) for a in arts),
+                         "遲延利息條文不是請求權基礎")
+
+    def test_relation_without_article(self):
+        b = S.extract_claim_basis("原告主張：被告向原告借款未還。爰依消費借貸及連帶保證之法律關係，請求被告連帶清償。")
+        self.assertEqual(b["claim_basis_primary"], "")
+        self.assertEqual(b["claim_basis_group"], "消費借貸")
+        self.assertEqual(json.loads(b["claim_basis_json"])["relations"], ["消費借貸", "連帶保證"])
+
+    def test_contract_name_without_falguanxi(self):
+        b = S.extract_claim_basis("原告主張：被告積欠消費款未付。爰依系爭信用卡契約提起本件訴訟。")
+        self.assertEqual(b["claim_basis_group"], "信用卡契約")
+
+    def test_specific_group_beats_generic_contract(self):
+        """REGRESSION：先寫「依系爭契約」、後寫「依消費借貸之法律關係」時，不能選到「其他契約」。"""
+        b = S.extract_claim_basis("原告主張：依系爭契約第5條約定，被告應按期還款。爰依消費借貸之法律關係，請求被告清償。")
+        self.assertEqual(b["claim_basis_group"], "消費借貸")
+
+    def test_procedural_law_is_not_a_basis(self):
+        b = S.extract_claim_basis("原告主張：爰依民事訴訟法第247條、民法第767條第1項規定，提起本件訴訟。")
+        self.assertEqual(b["claim_basis_primary"], "民法§767")
+        self.assertEqual(b["claim_basis_group"], "物權")
+
+    def test_empty(self):
+        self.assertEqual(S.extract_claim_basis("")["claim_basis_group"], "")
+
+
+class TestCaseTypeMid(unittest.TestCase):
+    """案由中間分類：侵權看原告主張的內容，其他大類看案由。"""
+
+    def test_tort_split_by_claim_text(self):
+        mid = lambda t: S.case_type_mid("侵權", "損害賠償", t)
+        self.assertEqual(mid("原告主張：被告駕駛自用小客車未注意車前狀況，追撞原告機車。"), "侵權：交通事故")
+        self.assertEqual(mid("原告主張：被告提供帳戶予詐欺集團使用，原告遭詐騙匯款。"), "侵權：詐騙")
+        self.assertEqual(mid("原告主張：被告明知原告配偶為有配偶之人，仍與之交往並發生性關係。"), "侵權：侵害配偶權")
+        self.assertEqual(mid("原告主張：被告於臉書公然侮辱原告，貶損原告名譽。"), "侵權：名譽與人格權")
+        self.assertEqual(mid("原告主張：被告不法侵害原告權利。"), "侵權：其他")
+
+    def test_traffic_death_is_not_spouse_right(self):
+        """REGRESSION：車禍死亡家屬依民法§195第3項主張身分法益，不能分到侵害配偶權。"""
+        self.assertEqual(S.case_type_mid(
+            "侵權", "損害賠償", "原告主張：被告駕駛大貨車肇事，致原告之父死亡，侵害原告基於父女關係之身分法益。"),
+            "侵權：交通事故")
+
+    def test_hospital_visit_after_accident_is_not_medical(self):
+        self.assertEqual(S.case_type_mid(
+            "侵權", "損害賠償", "原告主張：被告騎乘機車碰撞原告，原告送醫院急診，支出醫療費用。"),
+            "侵權：交通事故")
+
+    def test_non_tort_categories_use_case_type(self):
+        self.assertEqual(S.case_type_mid("契約", "給付工程款"), "契約：工程與承攬")
+        self.assertEqual(S.case_type_mid("勞動", "給付資遣費"), "勞動：資遣費")
+        self.assertEqual(S.case_type_mid("物權／不動產", "遷讓房屋"), "不動產：遷讓房屋")
+        self.assertEqual(S.case_type_mid("金融借貸", "清償借款"), "金融借貸")
+        self.assertEqual(S.case_type_mid("", ""), "")
