@@ -446,7 +446,7 @@ crawl_batched.py
 | 資料表 | 內容 |
 |--------|------|
 | `crawl_records` | 爬取紀錄（URL、HTML 路徑、是否已解析） |
-| `judgments` | 解析結果（原始欄位 30 欄＋結構化欄位 35 欄，另有記錄規則版本的 `structuring_version`） |
+| `judgments` | 解析結果（原始欄位 30 欄＋結構化欄位 44 欄，另有記錄規則版本的 `structuring_version`） |
 | `offenses` | 刑事判決附表的「被告 × 罪 × 宣告刑」，由 `build_offenses.py` 建立（沒執行過就不存在） |
 
 `browse_db.py` 會在 `judgments` 上建立 `idx_judgments_*` 索引（見上方
