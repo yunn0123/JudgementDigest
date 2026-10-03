@@ -28,7 +28,7 @@ databases:
           SELECT id, case_number, court, judgment_date, judgment_type,
                  case_type_norm, case_type_category, case_kind_category,
                  outcome, relief_type, claimed_amount, claimed_source,
-                 awarded_amount, grant_ratio, law_primary, judges,
+                 awarded_amount, grant_ratio, grant_ratio_source, law_primary, judges,
                  is_default_judgment, plaintiff_has_lawyer, defendant_has_lawyer,
                  defendant_is_corp, quality_flags, source_url
           FROM judgments

@@ -94,6 +94,7 @@ STRUCTURED_EXPORT_COLUMNS: List[tuple] = [
     ("claimed_currency",     "請求幣別"),
     ("claimed_source",       "請求金額來源"),
     ("grant_ratio",          "獲償比例"),
+    ("grant_ratio_source",   "獲償比例來源"),
     ("cost_share_plaintiff", "訴訟費用原告負擔比例"),
     ("law_primary",          "主要法規"),
     ("law_n_citations",      "法條引用數"),

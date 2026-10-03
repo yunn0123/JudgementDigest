@@ -762,12 +762,16 @@ def extract_awarded_amounts(verdict: str) -> Dict:
 # 於是抓到的是舊聲明或管轄權論述裡的數字，造成「判准大於請求」的矛盾。
 # 因此先找明確的錨點，找不到才退而求其次，且要求該段落後方真的出現金額。
 _CLAIM_ANCHORS = [
+    # 變更後的聲明優先，而且取**最後一次**變更（見 _CLAIM_CHANGE_RE 的說明）。
     # (?<!反)：「反訴之聲明」裡面也含有「訴之聲明」，不擋掉的話錨點會定位到
     # 反訴的聲明段，把反訴原告的請求當成本訴原告的請求。
     re.compile(r"(?<!反)訴之聲明\s*[:：]?"),
     re.compile(r"變更後聲明\s*[:：]?"),
     re.compile(r"並\s*聲明\s*[:：]"),
     re.compile(r"聲明\s*[:：]"),
+    # 「聲明求為判決：」「聲明求為如下之判決」——沒有緊接冒號，上一條抓不到，
+    # 會退回全文開頭 1500 字，把事實敘述裡的每個金額都加進請求金額。
+    re.compile(r"聲明(?:求為|請求)(?:如下之)?判決\s*[:：]?"),
 ]
 # 錨點後方必須在合理距離內出現「給付…元」，否則視為誤命中
 _CLAIM_VALIDATE_RE = re.compile(r"(?:給付|返還|賠償|支付|清償)[^。]{0,60}?元")
@@ -778,11 +782,45 @@ _CLAIM_VALIDATE_RE = re.compile(r"(?:給付|返還|賠償|支付|清償)[^。]{0
 #     …原告應分得680萬1,158元」-> claimed_total 把三個數字全加起來
 # 實測抽樣 1,192 筆 claimed_source=直接抽取 的案件，620 筆（52%）的視窗內
 # 出現對造答辯或反訴聲明的字樣。
+#
+# 後三行是聲明本身的結束點。少了它們，段落會一路讀進程序說明與法院判斷，
+# 而那裡會再複述一次請求金額：
+#   「並聲明：⑴被告應給付原告200,866元…⑶並願供擔保請准宣告假執行。
+#     三、經查，原告主張之上開事實…請求被告給付200,866元…」
+# 同一筆請求被加總兩到四次，grant_ratio 剛好落在 0.5、0.333、0.25。
+# 實測全部勝訴且請求金額為直接抽取的 10,354 筆中，3,270 筆（32%）比值小於 1。
+#   - 假執行聲請（願供擔保／請准宣告假執行）是聲明的最後一項
+#   - 核屬減縮、應予准許…是法院對聲明變更的程序判斷
+#   - 本院之判斷、經查、兩造不爭執…是法院開始論理
 _CLAIM_STOP_RE = re.compile(
     r"(?:被告|相對人|反訴原告|上訴人|被上訴人)[^。；，]{0,8}?(?:則以|則辯|辯稱|抗辯|答辯|置辯)"
     r"|反訴(?:之)?聲明"
     r"|等語(?:置辯|資為抗辯)"
-    r"|被告聲明\s*[:：]")
+    r"|被告聲明\s*[:：]"
+    r"|願(?:以[^。；]{0,30}?)?供擔保|請准(?:予)?(?:供擔保)?宣告假執行"
+    r"|核屬(?:擴張|減縮|變更|追加)|(?:核|於法)(?:並|尚)?無不合|應予准許|與[^。；]{0,10}規定相符"
+    r"|本院之判斷|得心證之理由|經查|兩造(?:不爭執|爭執|之爭點)"
+    # 一造辯論判決常見的接續句：聲明之後直接寫被告未到場、原告舉證
+    r"|被告[^。；]{0,12}?(?:經合法通知|未於(?:最後)?言詞辯論|未到場|未提出書狀)"
+    r"|原告(?:所)?主張之(?:上開|前揭|上揭|前開)?事實|業據(?:其|原告)?提出"
+    # 備位聲明是先位不成立時才審的替代請求，與先位擇一，不能相加。
+    # 實測 110 年度訴字第 357 號：先位、備位各 728 萬 5 千元，加總成 1,457 萬。
+    r"|備位(?:之)?聲明")
+
+# 聲明變更（減縮、擴張、更正）。判決書會先寫起訴時的聲明，再寫變更後的聲明：
+#   「原告起訴時聲明…60萬元。嗣…減縮該項聲明為『…1萬3,200元』」
+# 取起訴時的聲明會讓 grant_ratio 低估（上例算成 0.025，實際是全部勝訴）。
+# 一份判決可能變更多次，取最後一次。
+#
+# 寫法很多，實測需要三種句型：
+#   變更聲明為：／減縮將第2、3項聲明分別減縮為：（動詞在前）
+#   聲明減縮為請求被告給付56萬元（聲明在前）
+#   變更請求被告應給付78萬1,000元（沒有「聲明」二字）
+# (?!者) 排除法條引文「擴張或減縮應受判決事項之聲明者，不在此限」。
+_CLAIM_CHANGE_RE = re.compile(
+    r"(?:變更|減縮|擴張|更正)[^。；]{0,16}?(?:聲明|請求)(?!者)[^。；]{0,8}?(?:為|如下)\s*[:：]?"
+    r"|聲明[^。；]{0,6}?(?:變更|減縮|擴張|更正)為\s*[:：]?"
+    r"|(?:變更|減縮|擴張)為?請求(?=被告[^。；]{0,20}?給付)")
 _AS_VERDICT_RE = re.compile(r"如主文(?:第[一二三四五六七八九十\d]+項)?所示")
 # 聲明段落中的編號符號，先剝除才能正確判斷「如主文所示」是否為整段內容
 _ENUM_PREFIX_RE = re.compile(r"^[\s\d一二三四五六七八九十㈠-㈩\(（][\s\d一二三四五六七八九十㈠-㈩\)）.、,]*")
@@ -804,18 +842,22 @@ def extract_claimed_amount(
 
     claimed_source 取值：
       直接抽取  — 從聲明段落實際讀到金額
+      直接抽取（無聲明錨點）— 找不到聲明段落，從全文開頭讀到的金額，可信度較低
       主文回推  — 聲明寫「如主文所示」且全部勝訴，以判准金額代入
       未取得    — 兩者皆不可得
     """
     res = {"claimed_total": None, "claimed_currency": "", "claimed_source": "未取得",
-           "claimed_n_items": 0}
+           "claimed_n_items": 0, "claimed_fallback": 0}
 
     body = facts_and_reasons or facts or ""
     if body:
         text = re.sub(r"\s+", "", body)
         seg = ""
-        for anchor in _CLAIM_ANCHORS:
-            for am in anchor.finditer(text):
+        changes = list(_CLAIM_CHANGE_RE.finditer(text))
+        anchor_matches = ([[changes[-1]]] if changes else []) + \
+                         [list(a.finditer(text)) for a in _CLAIM_ANCHORS]
+        for matches in anchor_matches:
+            for am in matches:
                 cand = text[am.end(): am.end() + 1500]
                 # 先在對造答辯／反訴聲明處截斷，再驗證與抽金額。
                 # 順序不能反過來：先驗證的話，被對造金額「補足」的假聲明段
@@ -833,6 +875,7 @@ def extract_claimed_amount(
                 break
         if not seg:
             # 找不到可信的聲明錨點時才退回開頭 1500 字，同樣要在對造答辯處截斷
+            res["claimed_fallback"] = 1
             seg = text[:1500]
             stop = _CLAIM_STOP_RE.search(seg)
             if stop:
@@ -849,7 +892,11 @@ def extract_claimed_amount(
             res["claimed_currency"] = "/".join(currencies)
             if len(currencies) == 1:
                 res["claimed_total"] = sum(i["amount"] for i in items)
-                res["claimed_source"] = "直接抽取"
+                # 沒有聲明錨點時讀的是全文開頭，會把事實敘述裡的金額一起加總。
+                # 實測全部勝訴的案件中，這類金額算出的比值有 45% 小於 1，
+                # 有錨點者只有 7%，所以分開標記，不拿來計算 grant_ratio。
+                res["claimed_source"] = ("直接抽取（無聲明錨點）" if res["claimed_fallback"]
+                                         else "直接抽取")
                 return res
 
         # 聲明寫「如主文所示」→ 只有全部勝訴時，請求金額才等於判准金額
@@ -1335,11 +1382,74 @@ def _cost_share_plaintiff(verdict: str) -> Optional[float]:
     text = re.sub(r"\s+", "", verdict).replace("％", "%")
     # 「訴訟費用**新臺幣壹萬肆仟柒佰貳拾壹元**由被告負擔」這種寫法在
     # 「訴訟費用」與「由」之間夾了金額，要求兩者相鄰會整批漏掉。
-    m = re.search(r"訴訟費用[^，。；]{0,30}?由(?P<who>[^，。；]{0,20}?)負擔(?P<frac>[^，。；]{0,24})", text)
+    m = re.search(r"訴訟費用[^，。；]{0,30}?由", text)
+    if not m:
+        return None
+    # 費用分擔可能分成好幾句，要全部讀完才知道原告負擔多少：
+    #   「由被告余柏穎負擔23%，餘由被告李柏勳負擔」→ 原告 0（舊版只讀第一句，
+    #     把「被告負擔 23%」換算成原告負擔 77%）
+    #   「由被告甲、乙、丙、丁各負擔四分之一」→ 原告 0（舊版算成 75%）
+    #   「由兩造各負擔二分之一」→ 原告 0.5
+    #   「由被告負擔十分之三，餘由原告負擔」→ 原告 0.7
+    # 反訴的費用分擔與本訴無關，同一句裡出現時從「反訴」處截斷
+    clause = re.split(r"[，；]反訴", text[m.start():].split("。", 1)[0], 1)[0]
+    parts = list(re.finditer(
+        r"(?P<rest>餘(?:額|款|部分)?)?由(?P<who>[^，。；]{0,40}?)(?P<each>各)?負擔(?P<frac>[^，。；]{0,24})",
+        clause))
+    if len(parts) > 1:
+        explicit, plaintiff, rest_who, unknown = 0.0, 0.0, None, False
+        for p in parts:
+            who = p.group("who")
+            if p.group("rest"):
+                rest_who = who
+                continue
+            r = _parse_fraction(p.group("frac"))
+            if r is None:
+                unknown = True
+                continue
+            n = len([x for x in re.split(r"[、及與和]", who) if x]) if p.group("each") else 1
+            if "兩造" in who and p.group("each"):
+                explicit += 2 * r
+                plaintiff += r
+                continue
+            explicit += r * n
+            if "原告" in who and "被告" not in who:
+                plaintiff += r * n
+        if not unknown and explicit <= 1.0001:
+            if rest_who is not None:
+                if "原告" in rest_who and "被告" not in rest_who:
+                    plaintiff += 1.0 - explicit
+                elif "被告" not in rest_who and "兩造" not in rest_who:
+                    return None
+            return round(min(max(plaintiff, 0.0), 1.0), 4)
+        return None
+
+    m = parts[0] if parts else None
     if not m:
         return None
     who, frac = m.group("who"), m.group("frac")
+    if "兩造" in who and m.group("each"):
+        r = _parse_fraction(frac)
+        return round(r, 4) if r is not None else None
+    if m.group("each") and "被告" in who and "原告" not in who:
+        return 0.0
+    ratio = _parse_fraction(frac)
 
+    if ratio is None:
+        # 沒有比例 → 全部由某一方負擔
+        ratio = 1.0 if "原告" in who else (0.0 if "被告" in who else None)
+        return ratio
+
+    # 主文寫的是「由某方負擔 X」，換算成原告負擔比例
+    if "被告" in who:
+        return round(1.0 - ratio, 4)
+    if "原告" in who:
+        return round(ratio, 4)
+    return None
+
+
+def _parse_fraction(frac: str) -> Optional[float]:
+    """解析「負擔」後面的比例文字；沒有比例（例如全部負擔）回傳 None。"""
     # 主文寫比例的方式有四種，缺一種就會整批落空：
     #   百分之二十 / 20%  ·  千分之七  ·  二分之一  ·  5/100
     ratio = None
@@ -1371,18 +1481,7 @@ def _cost_share_plaintiff(verdict: str) -> Optional[float]:
                 num, den = int(fm.group(1)), int(fm.group(2))
                 if den > 0 and num <= den:
                     ratio = num / den
-
-    if ratio is None:
-        # 沒有比例 → 全部由某一方負擔
-        ratio = 1.0 if "原告" in who else (0.0 if "被告" in who else None)
-        return ratio
-
-    # 主文寫的是「由某方負擔 X」，換算成原告負擔比例
-    if "被告" in who:
-        return round(1.0 - ratio, 4)
-    if "原告" in who:
-        return round(ratio, 4)
-    return None
+    return ratio
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1408,6 +1507,7 @@ STRUCTURED_COLUMNS: List[Tuple[str, str]] = [
     ("claimed_currency",       "TEXT"),
     ("claimed_source",         "TEXT"),
     ("grant_ratio",            "REAL"),
+    ("grant_ratio_source",     "TEXT"),
     ("cost_share_plaintiff",   "REAL"),
     ("applicable_laws_json",   "TEXT"),
     ("law_n_citations",        "INTEGER"),
@@ -1444,7 +1544,7 @@ SOURCE_COLUMNS = [
 ]
 
 # 規則版本。規則異動時遞增，讓回填過的資料可以辨識是用哪一版規則產生的。
-STRUCTURING_VERSION = "2.2.0"
+STRUCTURING_VERSION = "2.3.0"
 
 
 def derive_structured_fields(row: Dict) -> Dict:
@@ -1505,6 +1605,25 @@ def derive_structured_fields(row: Dict) -> Dict:
             # 所以保留數字；但繼續標成「直接抽取」會讓人以為它可信，
             # 凡是照 claimed_source 篩選的分析都會把這 169 筆當成好資料。
             cl["claimed_source"] = "直接抽取（不完整）"
+
+    # ── 依判決結果補值：全部勝訴＝1、敗訴＝0 ──
+    # 舊版只在能「計算」時有值，敗訴的判決一律是空值（主文只有駁回，沒有判准
+    # 金額可除），於是對 grant_ratio 取平均只涵蓋至少判准一部分的案件，
+    # 平均會被高估；可用樣本也只剩三分之一。
+    #
+    # 這兩種補值是依定義而來，不是用判准金額回推請求金額的循環論證：
+    #   敗訴：判准為 0，只要確定原告請求的是金錢（聲明讀得到金額），比例就是 0。
+    #   全部勝訴：法院准許了原告請求的全部，比例就是 1。即使能從聲明算出比值，
+    #     也以 1 為準——全部勝訴卻算出小於 1，代表聲明金額抽多了（重複計算、
+    #     抓到減縮前的舊聲明），不是法院少判。
+    # 來源記在 grant_ratio_source，需要「純計算值」的分析可以只取「計算」。
+    grant_ratio_source = "計算" if grant_ratio is not None else ""
+    is_money = "金錢給付" in relief.split("／")
+    if oc["outcome"] == WIN and is_money:
+        grant_ratio, grant_ratio_source = 1.0, "全部勝訴"
+    elif (oc["outcome"] == LOSE and cl["claimed_total"]
+          and cl["claimed_source"].startswith("直接抽取")):
+        grant_ratio, grant_ratio_source = 0.0, "敗訴"
 
     # ── 金額缺漏的原因標記（區分「真的沒有」與「抽不到」）──
     if oc["outcome"] in (WIN, PARTIAL) and not aw["awarded_total"]:
@@ -1583,6 +1702,7 @@ def derive_structured_fields(row: Dict) -> Dict:
         "claimed_currency":     cl["claimed_currency"],
         "claimed_source":       cl["claimed_source"],
         "grant_ratio":          grant_ratio,
+        "grant_ratio_source":   grant_ratio_source,
         "cost_share_plaintiff": _cost_share_plaintiff(verdict),
         "applicable_laws_json": json.dumps(cites, ensure_ascii=False) if cites else "",
         "law_n_citations":      len(cites),

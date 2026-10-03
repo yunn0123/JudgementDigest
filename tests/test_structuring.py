@@ -831,17 +831,48 @@ class TestDeriveStructuredFields(unittest.TestCase):
         self.assertEqual(self.r["law_primary"], "民法")
 
     def test_grant_ratio_requires_direct_claim(self):
-        """回推的請求金額不得拿來算獲償比例。"""
+        """回推的請求金額不得拿來「計算」獲償比例；全部勝訴依定義補 1，並標明來源。"""
         row = dict(self.BASE, facts_and_reasons="原告聲明：如主文所示。",
                    verdict="被告應給付原告新臺幣500,000元。訴訟費用由被告負擔。")
         r = S.derive_structured_fields(row)
         self.assertEqual(r["claimed_source"], "主文回推")
+        self.assertEqual(r["grant_ratio"], 1.0)
+        self.assertEqual(r["grant_ratio_source"], "全部勝訴")
+
+    def test_full_win_overrides_computed_ratio(self):
+        """全部勝訴卻算出小於 1，是聲明金額抽多了，不是法院少判——以 1 為準。"""
+        row = dict(self.BASE,
+                   verdict="被告應給付原告新臺幣500,000元。訴訟費用由被告負擔。",
+                   facts_and_reasons="原告主張…並聲明：被告應給付原告新臺幣1,000,000元。")
+        r = S.derive_structured_fields(row)
+        self.assertEqual(r["grant_ratio"], 1.0)
+        self.assertEqual(r["grant_ratio_source"], "全部勝訴")
+
+    def test_loss_with_money_claim_is_zero_not_null(self):
+        """REGRESSION：敗訴的 grant_ratio 舊版是空值，平均獲償比例因此被高估。"""
+        row = dict(self.BASE, verdict="原告之訴駁回。訴訟費用由原告負擔。",
+                   facts_and_reasons="原告主張…並聲明：被告應給付原告新臺幣1,000,000元。")
+        r = S.derive_structured_fields(row)
+        self.assertEqual(r["grant_ratio"], 0.0)
+        self.assertEqual(r["grant_ratio_source"], "敗訴")
+
+    def test_loss_without_money_claim_stays_null(self):
+        """非金錢請求（例如塗銷登記）敗訴時沒有比例可言。"""
+        row = dict(self.BASE, verdict="原告之訴駁回。訴訟費用由原告負擔。",
+                   facts_and_reasons="原告主張…並聲明：被告應將系爭抵押權登記塗銷。")
+        r = S.derive_structured_fields(row)
         self.assertIsNone(r["grant_ratio"])
+        self.assertEqual(r["grant_ratio_source"], "")
+
+    def test_partial_win_ratio_is_computed(self):
+        r = S.derive_structured_fields(dict(self.BASE))
+        self.assertAlmostEqual(r["grant_ratio"], 0.5)
+        self.assertEqual(r["grant_ratio_source"], "計算")
 
     def test_impossible_ratio_is_voided_not_just_flagged(self):
         """REGRESSION：判准大於請求的比值必須作廢；只標記旗標，下游仍會誤用。"""
         row = dict(self.BASE,
-                   verdict="被告應給付原告新臺幣900,000元。訴訟費用由被告負擔。",
+                   verdict="被告應給付原告新臺幣900,000元。原告其餘之訴駁回。訴訟費用由被告負擔。",
                    facts_and_reasons="原告主張…並聲明：被告應給付原告新臺幣100,000元。")
         r = S.derive_structured_fields(row)
         self.assertIsNone(r["grant_ratio"])
@@ -856,6 +887,87 @@ class TestDeriveStructuredFields(unittest.TestCase):
         r = S.derive_structured_fields({})
         self.assertEqual(r["case_kind"], "")
         self.assertEqual(r["structuring_version"], S.STRUCTURING_VERSION)
+
+
+
+class TestClaimSegmentBoundaries(unittest.TestCase):
+    """REGRESSION：聲明段落沒有結束點時，同一筆請求被重複加總。
+
+    全部勝訴且請求金額為直接抽取的 10,354 筆中，3,270 筆（32%）比值小於 1，
+    大量落在 0.5、0.333、0.25——請求金額被算了二到四次。
+    """
+
+    def claimed(self, text):
+        return S.extract_claimed_amount(text, "", None, S.PARTIAL)
+
+    def test_stops_after_provisional_execution_request(self):
+        r = self.claimed("原告主張…並聲明：⑴被告應給付原告200,866元。⑵願供擔保請准宣告假執行。"
+                         "三、經查，原告請求被告給付200,866元，為有理由。")
+        self.assertEqual(r["claimed_total"], 200866)
+
+    def test_stops_at_default_judgment_statement(self):
+        r = self.claimed("並聲明：被告應給付原告4,468,205元。二、被告經合法通知，未於言詞辯論期日到場。"
+                         "三、原告主張之事實，業據其提出…請求被告給付4,468,205元。")
+        self.assertEqual(r["claimed_total"], 4468205)
+
+    def test_uses_last_amended_claim(self):
+        r = self.claimed("原告起訴時聲明第1項係「被告應連帶給付原告新臺幣60萬元。」，"
+                         "嗣具狀減縮該項聲明為「被告應連帶給付原告1萬3,200元。」核屬減縮應受判決事項之聲明，應予准許。")
+        self.assertEqual(r["claimed_total"], 13200)
+
+    def test_amended_claim_without_the_word_shengming(self):
+        r = self.claimed("原告起訴時請求被告應給付112萬1,000元本息，嗣於言詞辯論期日，"
+                         "變更請求被告應給付78萬1,000元本息。核屬減縮，應予准許。")
+        self.assertEqual(r["claimed_total"], 781000)
+
+    def test_statute_quote_is_not_an_amendment(self):
+        r = self.claimed("但擴張或減縮應受判決事項之聲明者，不在此限，民事訴訟法第255條定有明文。"
+                         "原告主張…並聲明：被告應給付原告50萬元。")
+        self.assertEqual(r["claimed_total"], 500000)
+
+    def test_alternative_claim_is_not_added(self):
+        """備位聲明與先位擇一，不能相加（實測 110 年度訴字第 357 號被算成兩倍）。"""
+        r = self.claimed("並聲明：⒈先位聲明：被告應連帶給付原告728萬5000元。"
+                         "⒉備位聲明：被告山豐公司應給付被告彩虹餘公司728萬5000元。")
+        self.assertEqual(r["claimed_total"], 7285000)
+
+    def test_qiu_wei_panjue_anchor(self):
+        r = self.claimed("被告積欠工資7,980元、資遣費166,260元，共計174,240元。"
+                         "爰依勞基法規定，聲明求為判決：被告應給付原告174,240元。三、被告未於言詞辯論期日到場。")
+        self.assertEqual(r["claimed_total"], 174240)
+        self.assertEqual(r["claimed_source"], "直接抽取")
+
+    def test_fallback_is_labelled(self):
+        r = self.claimed("原告主張被告應給付貨款30萬元，經催告仍未清償。")
+        self.assertEqual(r["claimed_source"], "直接抽取（無聲明錨點）")
+
+
+class TestCostShareMultiParty(unittest.TestCase):
+    """REGRESSION：訴訟費用分成好幾句或由多名被告分擔時，舊版只讀第一句。"""
+
+    def test_remainder_borne_by_another_defendant(self):
+        self.assertEqual(S._cost_share_plaintiff(
+            "訴訟費用由被告余柏穎負擔23％，餘由被告李柏勳負擔。"), 0.0)
+
+    def test_each_defendant_bears_a_share(self):
+        self.assertEqual(S._cost_share_plaintiff(
+            "訴訟費用由被告陳張春月、許明志、周榮南、李芃函各負擔四分之一。"), 0.0)
+
+    def test_both_parties_each(self):
+        self.assertEqual(S._cost_share_plaintiff("訴訟費用由兩造各負擔二分之一。"), 0.5)
+
+    def test_remainder_borne_by_plaintiff(self):
+        self.assertEqual(S._cost_share_plaintiff("訴訟費用由被告負擔十分之三，餘由原告負擔。"), 0.7)
+        self.assertAlmostEqual(S._cost_share_plaintiff(
+            "訴訟費用由被告負擔九分之一，其餘部分由原告負擔。"), 0.8889)
+
+    def test_counterclaim_costs_are_ignored(self):
+        self.assertEqual(S._cost_share_plaintiff(
+            "本訴訴訟費用由被告負擔，反訴訴訟費用由反訴原告負擔。"), 0.0)
+
+    def test_amount_instead_of_fraction_is_unknown(self):
+        self.assertIsNone(S._cost_share_plaintiff(
+            "訴訟費用新臺幣1,530元由被告負擔新臺幣1,170元，餘由原告負擔。"))
 
 
 if __name__ == "__main__":
@@ -951,7 +1063,7 @@ class TestClaimedSourceDowngrade(unittest.TestCase):
 
     def test_source_is_downgraded(self):
         row = dict(self.BASE,
-                   verdict="被告應給付原告新臺幣900,000元。訴訟費用由被告負擔。",
+                   verdict="被告應給付原告新臺幣900,000元。原告其餘之訴駁回。訴訟費用由被告負擔。",
                    facts_and_reasons="原告主張…並聲明：被告應給付原告新臺幣100,000元。")
         r = S.derive_structured_fields(row)
         self.assertEqual(r["claimed_source"], "直接抽取（不完整）")
@@ -968,7 +1080,7 @@ class TestClaimedSourceDowngrade(unittest.TestCase):
         """REGRESSION：round(1.0000295, 4) == 1.0，用四捨五入後的值比較
         會讓「判准比請求多幾十元」的矛盾靜靜溜過去（實測 2 筆）。"""
         row = dict(self.BASE,
-                   verdict="被告應給付原告新臺幣1,829,482元。訴訟費用由被告負擔。",
+                   verdict="被告應給付原告新臺幣1,829,482元。原告其餘之訴駁回。訴訟費用由被告負擔。",
                    facts_and_reasons="原告主張…並聲明：被告應給付原告新臺幣1,829,428元。")
         r = S.derive_structured_fields(row)
         self.assertEqual(r["claimed_source"], "直接抽取（不完整）")
@@ -977,7 +1089,7 @@ class TestClaimedSourceDowngrade(unittest.TestCase):
     def test_currency_mismatch_is_flagged(self):
         """幣別不同時兩個金額無從比較，必須標記。"""
         row = dict(self.BASE,
-                   verdict="被告應給付原告新臺幣39,000元。訴訟費用由被告負擔。",
+                   verdict="被告應給付原告新臺幣39,000元。原告其餘之訴駁回。訴訟費用由被告負擔。",
                    facts_and_reasons="原告主張…並聲明：被告應給付原告美金87元。")
         r = S.derive_structured_fields(row)
         self.assertIn("判准與請求幣別不同", r["quality_flags"])
