@@ -22,7 +22,7 @@ import random
 import re
 import argparse
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import unquote
 
@@ -612,13 +612,79 @@ def _sys_code(name: str) -> str:
     return _CASE_SYS_CODES.get(raw, "")
 
 
-def _roc_parts(date_str: str) -> Optional[Tuple[int, int, int]]:
-    """西元 YYYY/MM/DD（或 YYYY-MM-DD）→ (民國年, 月, 日)。"""
+def _parse_ad_date(date_str: str) -> Optional[date]:
+    """
+    西元 YYYY/MM/DD（或 YYYY-MM-DD）→ date；無法解析時回傳 None。
+
+    用 date() 建構而非單純 split，是為了連「不存在的日期」一起擋掉：
+    2024/13/45、2025/02/30 原本都會被拆成數字送進查詢表單。年份 <= 1911
+    則多半是誤把民國年填進來（114/03/01 會算出 -1797 年）。
+    """
     try:
         y, m, d = re.split(r"[/-]", date_str.strip())
-        return int(y) - 1911, int(m), int(d)
+        g = date(int(y), int(m), int(d))
     except Exception:
         return None
+    return g if g.year > 1911 else None
+
+
+def _roc_parts(date_str: str) -> Optional[Tuple[int, int, int]]:
+    """西元 YYYY/MM/DD（或 YYYY-MM-DD）→ (民國年, 月, 日)。"""
+    g = _parse_ad_date(date_str)
+    return (g.year - 1911, g.month, g.day) if g else None
+
+
+def parse_date_arg(value: str) -> date:
+    """
+    CLI 的日期參數 → date。不合法時拋 ValueError，訊息可直接交給 argparse 顯示。
+
+    日期參數若被靜默忽略，查詢會變成「沒有日期範圍」—— 使用者以為在抓一週，
+    實際上在抓全部。所以寧可在開瀏覽器之前就中止。
+    """
+    g = _parse_ad_date(value)
+    if g is None:
+        raise ValueError(f"日期格式錯誤：{value}（應為西元 YYYY/MM/DD，例如 2025/01/07）")
+    return g
+
+
+def resolve_date_range(
+    start_date: str = "",
+    end_date:   str = "",
+    start_year: int = 2015,
+    end_year:   Optional[int] = None,
+    today:      Optional[date] = None,
+) -> Tuple[date, date]:
+    """
+    把 CLI 的四個日期參數收斂成 (起日, 迄日)。任何一項不合法都拋 ValueError。
+
+    --start-date / --end-date 各自覆蓋對應的 --start-year / --end-year；
+    年份參數展開為該年的 1/1 與 12/31。未指定 --end-year 時迄日是「今天」
+    而非當年 12/31 —— 爬未來日期沒有意義。
+    """
+    today = today or date.today()
+
+    if start_date:
+        sd = parse_date_arg(start_date)
+    else:
+        try:
+            sd = date(start_year, 1, 1)
+        except ValueError:
+            raise ValueError(f"起始年份無效：{start_year}")
+
+    if end_date:
+        ed = parse_date_arg(end_date)
+    elif end_year:
+        try:
+            ed = date(end_year, 12, 31)
+        except ValueError:
+            raise ValueError(f"結束年份無效：{end_year}")
+    else:
+        ed = today
+
+    if sd > ed:
+        raise ValueError(
+            f"起始日期 {sd:%Y/%m/%d} 晚於結束日期 {ed:%Y/%m/%d}")
+    return sd, ed
 
 
 def _dismiss_alert(driver: webdriver.Chrome) -> str:
@@ -671,6 +737,18 @@ def _ad_search(
     法院與案件類別同樣是查詢條件（非結果頁分群），故各條件組合都有自己的 500 額度。
     回傳 (結果列表 URL, 總筆數)；查詢失敗回傳 (None, None)。
     """
+    # 日期先驗證再開瀏覽器。無法解析的日期若只印 warning 就跳過，查詢會變成
+    # 「沒有日期範圍」——使用者以為在抓一週，實際在抓全部，而且不會有任何錯誤訊息。
+    values: Dict[str, int] = {}
+    for label, ds in (("1", start_date), ("2", end_date)):
+        if not ds:
+            continue
+        parts = _roc_parts(ds)
+        if parts is None:
+            logger.error("Invalid date %r (expected YYYY/MM/DD) — search aborted", ds)
+            return None, None
+        values[f"dy{label}"], values[f"dm{label}"], values[f"dd{label}"] = parts
+
     driver.get(BASE_URL_AD)
     time.sleep(2.5)
     _dismiss_alert(driver)
@@ -707,16 +785,6 @@ def _ad_search(
     if court or wanted_sys:
         # 勾選法院／案件類別會觸發「常用字別」的 AJAX，稍候再送出以免競態
         time.sleep(1.0)
-
-    values = {}
-    for label, ds in (("1", start_date), ("2", end_date)):
-        if not ds:
-            continue
-        parts = _roc_parts(ds)
-        if parts is None:
-            logger.warning("Cannot parse date %r — ignored", ds)
-            continue
-        values[f"dy{label}"], values[f"dm{label}"], values[f"dd{label}"] = parts
 
     for fid in _AD_DATE_FIELDS:
         el = driver.find_element(By.ID, fid)
@@ -853,10 +921,21 @@ def _parse_case_rows(driver: webdriver.Chrome) -> List[Dict]:
 
 
 # ─── Step C: 翻頁 ─────────────────────────────────────────────────────────────
+class NextPageLoadError(Exception):
+    """「下一頁」存在，但點擊或載入失敗。
+
+    必須和「沒有下一頁」分開：兩者都回傳 False 時，呼叫端會把載入逾時當成翻完，
+    該區段較舊的頁面就被靜靜略過，月份照樣標成 done。實測 2022/05/16~23 翻到
+    第 13 頁逾時後就結束，應有 23 頁，5/16~18 三天的判決整批遺漏。
+    """
+
+
 def _go_next_page(driver: webdriver.Chrome) -> bool:
     """
     點擊「下一頁」並等待新頁案件連結出現。
     使用 JS click 避免元素被遮擋時的 ElementClickInterceptedException。
+    回傳 True = 已翻到下一頁；False = 沒有下一頁（已翻完）。
+    有下一頁但重試後仍點不動或載不出來 → raise NextPageLoadError。
     """
     next_el = None
     for sel in ("a[title='下一頁']", "a.page-next", "[class*='nextpage'] a"):
@@ -885,7 +964,7 @@ def _go_next_page(driver: webdriver.Chrome) -> bool:
             if _pg_attempt == 0:
                 time.sleep(10)
                 continue
-            return False
+            raise NextPageLoadError(f"click failed: {exc}")
 
         # 等待新頁的案件連結出現（舊連結會因 DOM 更新而失效）
         time.sleep(1)
@@ -911,9 +990,10 @@ def _go_next_page(driver: webdriver.Chrome) -> bool:
                     except NoSuchElementException:
                         pass
                 if next_el is None:
-                    return False
+                    # 頁面載到一半，找不到按鈕不代表已經是最後一頁
+                    raise NextPageLoadError("next button lost after timeout")
                 continue
-            return False  # 第二次逾時仍未載入 → 放棄翻頁
+            raise NextPageLoadError("page load timed out twice")
     return False
 
 
@@ -1091,7 +1171,11 @@ def search_and_crawl(
             pacer.on_failure(marker)          # 全域降速：這是伺服器在抗議
             for wait in (3, 10, 30):
                 time.sleep(wait)
-                driver.get(_page_url(base_url, page))
+                try:
+                    driver.get(_page_url(base_url, page))
+                except WebDriverException as exc:     # 含 page load timeout
+                    logger.warning("  ↳ 重載 page=%d 失敗：%s", page, exc.__class__.__name__)
+                    continue
                 time.sleep(1.5)
                 if not _list_page_error(driver):
                     logger.info("  ↳ 重載成功，自 page=%d 續翻", page)
@@ -1103,7 +1187,11 @@ def search_and_crawl(
                 driver, query_keyword, start_date, end_date, court, tuple(case_types))
             if not new_url:
                 return False
-            driver.get(_page_url(_carry_group_params(base_url, new_url), page))
+            try:
+                driver.get(_page_url(_carry_group_params(base_url, new_url), page))
+            except WebDriverException as exc:
+                logger.warning("  ↳ 重新查詢後載入 page=%d 失敗：%s", page, exc.__class__.__name__)
+                return False
             time.sleep(1.5)
             ok = not _list_page_error(driver)
             logger.info("  ↳ 重新查詢後%s（page=%d）", "復原成功" if ok else "仍失敗", page)
@@ -1118,6 +1206,7 @@ def search_and_crawl(
             nonlocal page_errors
             page = 1
             raw_seen = 0
+            jumped = False    # 目前這頁是翻頁失敗後以頁碼網址跳過來的：一定要有資料
             while len(all_items) < max_results:
                 raw_items = _parse_case_rows(driver)
                 if not raw_items:
@@ -1132,7 +1221,13 @@ def search_and_crawl(
                             "清單頁無法復原（%s）%s page=%d — 此區段資料不完整",
                             marker, label or "", page,
                         )
+                    elif jumped:
+                        # 上一頁明明有「下一頁」，跳過來卻是空的 → 不是翻完，是沒載到
+                        page_errors += 1
+                        logger.error("翻頁復原後 page=%d 仍無資料%s — 此區段資料不完整",
+                                     page, label or "")
                     break
+                jumped = False
                 raw_seen += len(raw_items)
                 fresh = [it for it in _filter_by_judgment_type(_filter_by_case_year(raw_items))
                          if it.get("url") and it["url"] not in seen_urls]
@@ -1144,7 +1239,19 @@ def search_and_crawl(
                 logger.info("  %d / %d collected%s", len(all_items), max_results, label)
                 if len(all_items) >= max_results:
                     break
-                if not _go_next_page(driver):
+                try:
+                    if not _go_next_page(driver):
+                        break
+                except NextPageLoadError as exc:
+                    # 不能當成翻完：改用頁碼網址直接跳到下一頁（必要時重送查詢）
+                    page += 1
+                    if _recover_list_page(base_url, page, f"翻頁失敗：{exc}", label):
+                        jumped = True
+                        pacer.wait("list")
+                        continue
+                    page_errors += 1
+                    logger.error("翻頁失敗且無法復原%s page=%d — 此區段資料不完整",
+                                 label or "", page)
                     break
                 page += 1
                 pacer.wait("list")
@@ -1392,6 +1499,18 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     case_types = tuple(t.strip() for t in args.case_type.split(",") if t.strip())
+
+    # 日期在開瀏覽器之前就驗證；本檔把日期當字串傳給查詢表單，
+    # 不擋的話打錯一個字就會静默變成「沒有日期範圍」的查詢。
+    for _flag, _raw in (("--start-date", args.start_date), ("--end-date", args.end_date)):
+        if _raw:
+            try:
+                parse_date_arg(_raw)
+            except ValueError as exc:
+                ap.error(f"{_flag}：{exc}")
+    if args.start_date and args.end_date:
+        if parse_date_arg(args.start_date) > parse_date_arg(args.end_date):
+            ap.error(f"起始日期 {args.start_date} 晚於結束日期 {args.end_date}")
 
     if args.recrawl_stubs:
         n = recrawl_stubs(headless=not args.no_headless)

@@ -36,6 +36,7 @@ def merge_workbooks(paths: list[Path], output: Path) -> dict[str, int]:
     target = Workbook(write_only=True)
     sheets = {}
     counts = {name: 0 for name in sheet_names}
+    seen_links = {name: set() for name in sheet_names}
     for name in sheet_names:
         sheet = target.create_sheet(name)
         header_cells = []
@@ -53,9 +54,16 @@ def merge_workbooks(paths: list[Path], output: Path) -> dict[str, int]:
             source = workbook[name]
             source_headers = [cell.value for cell in next(source.iter_rows(max_row=1))]
             positions = {header: index for index, header in enumerate(source_headers)}
+            link_index = positions.get("裁判書連結")
             for row in source.iter_rows(min_row=2, values_only=True):
+                link = row[link_index] if link_index is not None and link_index < len(row) else ""
+                if link and link in seen_links[name]:
+                    continue
+                if link:
+                    seen_links[name].add(link)
                 sheets[name].append([
-                    row[positions[header]] if header in positions else "" for header in headers[name]
+                    row[positions[header]] if header in positions and positions[header] < len(row) else ""
+                    for header in headers[name]
                 ])
                 counts[name] += 1
         workbook.close()

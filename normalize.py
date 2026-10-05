@@ -7,12 +7,11 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from structure_tasks import chinese_number
+
 
 SOURCE_SHEET = "罪法刑結構化"
 OUTPUT_SHEET = "標準化"
-CN_DIGITS = {"零": 0, "〇": 0, "○": 0, "一": 1, "二": 2, "三": 3, "四": 4,
-             "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-CN_UNITS = {"十": 10, "百": 100, "千": 1000, "萬": 10_000}
 ARTICLE_RE = re.compile(
     r"第(?P<article>[零〇○一二三四五六七八九十百千萬壹貳參叁肆伍陸柒捌玖拾佰仟0-9]+)條"
 )
@@ -135,26 +134,6 @@ CHARGE_RULES = (
 )
 
 
-# 將中文或阿拉伯條號轉為整數，統一常見法的主條編號。
-def numeral_to_int(value: str) -> int:
-    if value.isdigit():
-        return int(value)
-    value = value.translate(str.maketrans("壹貳參叁肆伍陸柒捌玖拾佰仟", "一二三三四五六七八九十百千"))
-    total = section = number = 0
-    for char in value:
-        if char in CN_DIGITS:
-            number = CN_DIGITS[char]
-        elif char in CN_UNITS:
-            unit = CN_UNITS[char]
-            if unit == 10_000:
-                total += (section + number) * unit
-                section = number = 0
-            else:
-                section += (number or 1) * unit
-                number = 0
-    return total + section + number
-
-
 # 拆開 structure_tasks.py 使用的 [A,B,C] 多標籤格式，空清單不產生項目。
 def split_labels(value: object) -> list[str]:
     text = str(value or "").strip()
@@ -171,16 +150,15 @@ def normalize_law_levels(value: object) -> tuple[str, str]:
     previous_name = ""
     for raw in split_labels(value):
         compact = re.sub(r"\s+", "", raw)
-        name = next((law for law in COMMON_LAWS if law in compact), "")
-        if name == "刑法" and "陸海空軍刑法" in compact:
-            name = ""
+        compact = re.sub(r"^(?:(?:中華民國|修正前|修正後|前開)+)", "", compact)
+        name = next((law for law in COMMON_LAWS if compact.startswith(f"{law}第")), "")
         if not name and previous_name and any(word in compact for word in ("同法", "該法", "同條例", "該條例")):
             name = previous_name
         match = ARTICLE_RE.search(compact)
         if not name or not match:
             continue
         previous_name = name
-        law = f'{name}第{numeral_to_int(match.group("article"))}條'
+        law = f'{name}第{chinese_number(match.group("article"))}條'
         if law not in normalized:
             normalized.append(law)
     if not normalized:

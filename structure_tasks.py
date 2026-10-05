@@ -3,6 +3,7 @@
 import argparse
 import re
 from pathlib import Path
+from typing import Optional
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -12,25 +13,30 @@ SOURCE_SHEET = "裁判書資料"
 OUTPUT_SHEET = "罪法刑結構化"
 NON_GUILTY_WORDS = ("無罪", "不受理", "免訴")
 NUM = "零〇○一二三四五六七八九十百千萬億壹貳參叁肆伍陸柒捌玖拾佰仟0123456789"
+# {1,18} 允許單字法律名（民法、刑法）：{2,18} 會要求「法／條例」前至少 2 字，
+# 「民法」「刑法」只有 1 字前綴，永遠比對不到（容嫣於 PR #4 留言回報，appendix_parser
+# 的 _LAW_PREFIX 已用同樣理由改過）。lazy 量詞會優先取最短，不會因此多抓到
+# 「應依」等觸發詞殘留。
 LAW_RE = re.compile(
     rf"(?:係犯|共同犯|違反|適用|應依|依|按|犯|、|，|；|^)"
-    # 法規名在「法」前可能只有一字（例如刑法、民法），下限必須是 1。
     rf"([^，、；。：（）()\s]{{1,18}}?(?:條例|法))第[{NUM}]+條"
     rf"(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?"
 )
 CHARGE_AFTER_LAW_RE = re.compile(r"之?([^，、；。]{2,80}罪)(?=[，、；。]|$)")
 VERDICT_CHARGE_RE = re.compile(
-    r"(?<!罪)犯([^；。]{2,160}?罪)(?=，(?:(?:累犯|未遂)，)?(?:均處|各處|處|科|免刑)|[；。]|$)"
+    r"(?<!罪)犯(?!罪事實)([^；。]{2,160}?罪)"
+    rf"(?=，(?:共?[{NUM}]+罪，)?(?:(?:累犯|未遂)，)?(?:均處|各處|處|科|免刑)|[；。]|$)"
 )
 APPENDIX_REFERENCE_RE = re.compile(r"^(?:(?:如|本).{0,12})?附表")
-MAIN_END_RE = re.compile(r"犯罪事實及理由|事實及理由|事實與理由|犯罪事實")
+MAIN_END_RE = re.compile(r"(?:犯罪事實及理由|事實及理由|事實與理由|犯罪事實)(?!欄|要旨)")
+# 罰金金額允許千分位逗號，但不併入 NUM，避免法條條號誤接受逗號。
 TOTAL_RE = re.compile(
     rf"應執(?:行|刑)(?:之刑為)?(死刑|無期徒刑|有期徒(?:刑)?[{NUM}]+年(?:[{NUM}]+月)?|"
-    rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM}]+元)"
+    rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM},]+元)"
 )
 SINGLE_RE = re.compile(
     rf"(?<!易)(?:處|科)(死刑|無期徒刑|有期徒(?:刑)?[{NUM}]+年(?:[{NUM}]+月)?|"
-    rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM}]+元)"
+    rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM},]+元)"
 )
 CN_DIGITS = {
     "零": 0, "〇": 0, "○": 0, "一": 1, "壹": 1, "二": 2, "貳": 2,
@@ -49,15 +55,30 @@ def compact(value) -> str:
 
 # 截掉誤併入主文欄的事實與理由，避免把後文論罪或前科當成本案主文。
 def main_section(verdict: str) -> str:
+    marker = re.search(r"主文[：:]", verdict)
+    if marker:
+        verdict = verdict[marker.end():]
     return MAIN_END_RE.split(verdict, maxsplit=1)[0]
 
 
 # 將中文大小寫數字或阿拉伯數字轉為整數，供刑期月份正規化使用。
+# 支援阿拉伯數字與中文單位混寫（如「10萬」「3萬6千」）：逐字掃描時，連續的
+# 阿拉伯數字要當成一個多位數整體讀入，不能像中文數字那樣一字一位，否則
+# 「10萬」會因為阿拉伯字元不在 CN_DIGITS 裡被忽略、算成 0。
 def chinese_number(value: str) -> int:
     if value.isdigit():
         return int(value)
     total = section = number = 0
-    for char in value:
+    i, length = 0, len(value)
+    while i < length:
+        char = value[i]
+        if char.isdigit():
+            j = i + 1
+            while j < length and value[j].isdigit():
+                j += 1
+            number = int(value[i:j])
+            i = j
+            continue
         if char in CN_DIGITS:
             number = CN_DIGITS[char]
         elif char in CN_UNITS:
@@ -69,6 +90,7 @@ def chinese_number(value: str) -> int:
             else:
                 section += (number or 1) * unit
                 number = 0
+        i += 1
     return total + section + number
 
 
@@ -118,10 +140,13 @@ def extract_laws(reason: str, applicable_laws: str, facts: str = "") -> list[str
             sentence for sentence in re.split(r"[。；]", text)
             if not conclusions_only or "係犯" in sentence or ("違反" in sentence and "罪" in sentence)
         ]
-        found = [clean_law(match) for passage in passages for match in LAW_RE.finditer(passage)]
+        found = [
+            law for passage in passages for match in LAW_RE.finditer(passage)
+            if not (law := clean_law(match)).startswith(("刑事訴訟法", "刑法施行法"))
+        ]
         if found:
             break
-    return unique(law for law in found if not law.startswith(("刑事訴訟法", "刑法施行法")))
+    return unique(found)
 
 
 # 主文只接受明載「犯○○罪」的結果，附表引用不是罪名。
@@ -167,17 +192,21 @@ def normalize_sentence(sentence: str) -> str:
     return re.sub(r"^有期徒(?!刑)", "有期徒刑", sentence)
 
 
-# 將有期徒刑換算成月；死刑、無期徒刑、拘役與罰金不硬轉成不相容單位。
+# 將單一「有期徒刑…」宣告刑換算成月數；死刑、無期徒刑、拘役與罰金不硬轉成
+# 不相容單位，回傳 None。appendix_parser.py 的附表逐列換算也共用這支，
+# 避免兩邊各自維護一份「年×12+月」的算法而逐漸不一致。
+def sentence_to_months(sentence: str) -> Optional[int]:
+    if not sentence.startswith("有期徒刑"):
+        return None
+    year = re.search(rf"([{NUM}]+)年", sentence)
+    month = re.search(rf"([{NUM}]+)月", sentence)
+    return (chinese_number(year.group(1)) * 12 if year else 0) + (
+        chinese_number(month.group(1)) if month else 0)
+
+
+# 將整案的宣告刑清單換算成月，供「總執行刑（月）」欄使用。
 def sentence_months(sentences: list[str]) -> list[str]:
-    months = []
-    for sentence in sentences:
-        if not sentence.startswith("有期徒刑"):
-            continue
-        year = re.search(rf"([{NUM}]+)年", sentence)
-        month = re.search(rf"([{NUM}]+)月", sentence)
-        months.append(str((chinese_number(year.group(1)) * 12 if year else 0)
-                          + (chinese_number(month.group(1)) if month else 0)))
-    return months
+    return [str(m) for s in sentences if (m := sentence_to_months(s)) is not None]
 
 
 # 提供案件層級的最高有期徒刑月份；其他刑種不強制換算為月份。
@@ -313,7 +342,7 @@ def self_check() -> None:
 # 提供可直接套用預設檔名的命令列入口，也允許覆寫輸入與輸出路徑。
 def main() -> None:
     parser = argparse.ArgumentParser(description="萃取每案罪名、法條、宣告刑與應執行刑")
-    parser.add_argument("input", nargs="?", default="2425_07-12.xlsx", type=Path)
+    parser.add_argument("input", type=Path)
     parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args()
     output = args.output or args.input.with_name(f"{args.input.stem}_structured.xlsx")

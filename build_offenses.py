@@ -14,10 +14,16 @@ DB_PATH = "judgments.db"
 
 
 def build(keyword: str = "ADV:TPD:M") -> None:
+    """重建 offenses 表。
+
+    建在暫存表 offenses_new，全部寫入成功後才 DROP 舊表、改名頂替，
+    這樣中途出錯（例如某份 HTML 解析炸掉）不會讓既有的 offenses 表被清空；
+    單一檔案的錯誤只跳過該檔並計入 errors，不會中斷整批。
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.executescript("""
-        DROP TABLE IF EXISTS offenses;
-        CREATE TABLE offenses (
+        DROP TABLE IF EXISTS offenses_new;
+        CREATE TABLE offenses_new (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             crawl_id    INTEGER REFERENCES crawl_records(id),
             case_number TEXT,
@@ -33,32 +39,55 @@ def build(keyword: str = "ADV:TPD:M") -> None:
             fine_type   TEXT,
             raw         TEXT
         );
-        CREATE INDEX idx_offenses_case ON offenses(case_number);
     """)
     rows = conn.execute(
         "SELECT c.id, c.case_number, c.html_file, j.defendant FROM crawl_records c "
         "LEFT JOIN judgments j ON j.crawl_id = c.id "
         "WHERE c.keyword LIKE ? AND c.case_number LIKE '%判決' "
         "AND instr(COALESCE(j.full_text, ''), '判決') > 0", (keyword + "%",)).fetchall()
-    hit = n = 0
+    if not rows:
+        # --keyword 沒對到任何資料時直接中止、不動既有的 offenses 表：main 合併後
+        # 爬蟲標籤格式已改成「臺灣臺北地方法院-刑事-判決」，此函式預設的
+        # ADV:TPD:M 是我們早期爬蟲用的標籤，兩者不通用。若不擋在這裡，下面的
+        # DROP + RENAME 仍會把既有的 offenses 表換成一張空表（容嫣於 PR #4
+        # 留言回報：合併 main 後不加 --keyword 執行會把 offenses 表清空）。
+        conn.execute("DROP TABLE IF EXISTS offenses_new")
+        conn.commit()
+        conn.close()
+        raise SystemExit(
+            f"--keyword {keyword!r} 查無符合的判決，未動既有的 offenses 表。"
+            "請確認標籤格式（例如新版爬蟲用「臺灣臺北地方法院-刑事-判決」）。")
+    hit = n = errors = 0
     for crawl_id, case_number, html_file, defendants in rows:
-        try:
-            html = open(html_file, encoding="utf-8").read()
-        except OSError:
+        if not html_file:
+            errors += 1
             continue
-        offs = extract_appendix_offenses(html, names=[n.strip() for n in (defendants or "").split("；") if n.strip()])
+        try:
+            with open(html_file, encoding="utf-8") as f:
+                html = f.read()
+            offs = extract_appendix_offenses(
+                html, names=[nm.strip() for nm in (defendants or "").split("；") if nm.strip()])
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            errors += 1
+            print(f"  [WARN] 解析失敗，略過：{html_file}（{exc}）")
+            continue
         if offs:
             hit += 1
-        for o in offs:
-            conn.execute(
-                "INSERT INTO offenses (crawl_id, case_number, table_idx, row_no, defendant, law, charge,"
-                " sentence, months, days, fine, fine_type, raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (crawl_id, case_number, o["table"], o["no"], o["defendant"], o["law"], o["charge"],
-                 o["sentence"], o["months"], o["days"], o["fine"], o["fine_type"], o["raw"]))
-            n += 1
+        conn.executemany(
+            "INSERT INTO offenses_new (crawl_id, case_number, table_idx, row_no, defendant, law, charge,"
+            " sentence, months, days, fine, fine_type, raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(crawl_id, case_number, o["table"], o["no"], o["defendant"], o["law"], o["charge"],
+              o["sentence"], o["months"], o["days"], o["fine"], o["fine_type"], o["raw"]) for o in offs])
+        n += len(offs)
+    conn.executescript("""
+        DROP TABLE IF EXISTS offenses;
+        ALTER TABLE offenses_new RENAME TO offenses;
+        CREATE INDEX idx_offenses_case ON offenses(case_number);
+    """)
     conn.commit()
     conn.close()
-    print(f"判決 {len(rows)} 筆，其中 {hit} 筆有附表宣告刑，共寫入 {n} 列")
+    err_note = f"，{errors} 筆解析失敗已略過" if errors else ""
+    print(f"判決 {len(rows)} 筆，其中 {hit} 筆有附表宣告刑，共寫入 {n} 列{err_note}")
 
 
 EXPORT_COLUMNS = [
@@ -70,33 +99,37 @@ EXPORT_COLUMNS = [
 
 
 def export_excel(path: str) -> int:
-    """把 offenses 表匯出成 Excel（一列一個被告×罪×宣告刑），回傳列數。"""
+    """把 offenses 表匯出成 Excel（一列一個被告×罪×宣告刑），回傳列數。
+
+    樣式沿用 export_excel.py 的共用輔助（標題列樣式／斑馬紋／欄寬），
+    不重寫一份幾乎一樣的 openpyxl 設定，兩邊的 Excel 外觀才不會各自漂移。
+    """
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from export_excel import _header_style, _data_style, _set_col_widths
 
     conn = sqlite3.connect(DB_PATH)
+    if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='offenses'").fetchone():
+        conn.close()
+        raise SystemExit("offenses 表不存在，請先不加 --export-only 跑一次建表。")
     cols = ", ".join(f"o.{c}" if c != "judgment_date" else "j.judgment_date" for _, c in EXPORT_COLUMNS)
     rows = conn.execute(
         f"SELECT {cols} FROM offenses o LEFT JOIN judgments j ON j.crawl_id = o.crawl_id "
         "ORDER BY j.judgment_date, o.case_number, o.id").fetchall()
     conn.close()
 
+    col_names = [name for name, _ in EXPORT_COLUMNS]
     wb = Workbook()
     ws = wb.active
     ws.title = "附表宣告刑"
-    ws.append([name for name, _ in EXPORT_COLUMNS])
+    ws.append(col_names)
     for row in rows:
         ws.append(list(row))
-    for cell in ws[1]:
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.fill = PatternFill("solid", fgColor="1F3864")
+    _header_style(ws)
+    _data_style(ws, len(rows))
+    _set_col_widths(ws, col_names)
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    for col, width in zip("ABCDEFGHIJKL", (38, 14, 16, 30, 28, 20, 12, 10, 14, 10, 10, 60)):
-        ws.column_dimensions[col].width = width
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
     wb.save(path)
     return len(rows)
 
