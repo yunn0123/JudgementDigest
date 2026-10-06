@@ -135,8 +135,10 @@ class TestMergeDeduplication(unittest.TestCase):
                 workbook.save(path)
             output = Path(directory) / "merged.xlsx"
             self.assertEqual(merge_workbooks(paths, output)["裁判書資料"], 3)
-            values = list(load_workbook(output, read_only=True)["裁判書資料"].values)
+            workbook = load_workbook(output, read_only=True)
+            values = list(workbook["裁判書資料"].values)
             self.assertEqual(values[1:], [("u1", "A"), ("u2", "B"), ("u3", "C")])
+            workbook.close()
 
 
 if __name__ == "__main__":

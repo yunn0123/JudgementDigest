@@ -115,10 +115,12 @@ class TestExportToExcel(_TempDbCase):
         rows = fetch_judgments(limit=1)
         rows[0]["verdict"] = "合法\x00文字\x0b保留"
         self.assertTrue(export_to_excel(rows, out, include_full_text=False))
-        sheet = load_workbook(out, read_only=True).active
+        workbook = load_workbook(out, read_only=True)
+        sheet = workbook.active
         headers = [cell.value for cell in sheet[1]]
         verdict_column = headers.index("主文") + 1
         self.assertEqual(sheet.cell(2, verdict_column).value, "合法文字保留")
+        workbook.close()
 
     def test_base_columns_cover_db_schema(self):
         # BASE_COLUMNS 的每個欄位都必須存在於 judgments 表，否則匯出會整批失敗

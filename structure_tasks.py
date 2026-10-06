@@ -3,7 +3,7 @@
 import argparse
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -210,7 +210,7 @@ def sentence_months(sentences: list[str]) -> list[str]:
 
 
 # 提供案件層級的最高有期徒刑月份；其他刑種不強制換算為月份。
-def maximum_sentence_months(sentences: list[str]) -> int | str:
+def maximum_sentence_months(sentences: list[str]) -> Union[int, str]:
     months = sentence_months(sentences)
     return max(map(int, months)) if months else ""
 
