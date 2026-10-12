@@ -15,11 +15,9 @@ OUTPUT_SHEET = "標準化"
 ARTICLE_RE = re.compile(
     r"第(?P<article>[零〇○一二三四五六七八九十百千萬壹貳參叁肆伍陸柒捌玖拾佰仟0-9]+)條"
 )
-# 依有罪案件的案件出現次數選取前十個實體／特別法；程序法不作為定罪標籤。
+# 依有罪案件的案件出現次數只保留前三個實體／特別法；程序法不作為定罪標籤。
 COMMON_LAWS = (
-    "刑法", "毒品危害防制條例", "洗錢防制法", "組織犯罪防制條例",
-    "道路交通管理處罰條例", "商業會計法", "商標法",
-    "槍砲彈藥刀械管制條例", "藥事法", "家庭暴力防治法",
+    "刑法", "毒品危害防制條例", "洗錢防制法",
 )
 CHARGE_RULES = (
     (re.compile(r"尿液所含毒品|駕駛動力交通工具.*毒品"), "毒駕罪"),
@@ -39,7 +37,7 @@ CHARGE_RULES = (
     (re.compile(r"偽造.*有價證券|行使.*有價證券"), "偽造有價證券罪"),
     (re.compile(r"偽造署押"), "偽造署押罪"),
     (re.compile(r"填製不實.*(?:會計憑證|罪)|不實.*會計憑證"), "填製不實會計憑證罪"),
-    (re.compile(r"侵占"), "侵占罪"),
+    (re.compile(r"侵占.*"), "侵占罪"),
     (re.compile(r"竊佔"), "竊佔罪"),
     (re.compile(r"恐嚇"), "恐嚇罪"),
     (re.compile(r"毀損|毀棄損壞|致令他人物品不堪用"), "毀損罪"),
@@ -48,6 +46,8 @@ CHARGE_RULES = (
     (re.compile(r"洗錢"), "洗錢罪"),
     (re.compile(r"犯罪組織|參與組織"), "組織犯罪罪"),
     (re.compile(r"妨害公務|侮辱公務員|公務員.*施.*強暴|強暴侮辱"), "妨害公務罪"),
+    (re.compile(r"公務員.*執行.*當場侮辱"), "侮辱公務員罪"),
+    (re.compile(r"僭行公務員職權"), "僭行公務員職權罪"),
     (re.compile(r"強制性交"), "強制性交罪"),
     (re.compile(r"強制猥褻"), "強制猥褻罪"),
     (re.compile(r"殺人"), "殺人罪"),
@@ -77,9 +77,10 @@ CHARGE_RULES = (
     (re.compile(r"非法經營期貨"), "非法經營期貨業務罪"),
     (re.compile(r"內線交易"), "內線交易罪"),
     (re.compile(r"損壞公務員.*掌管"), "損壞公務物品罪"),
+    (re.compile(r"損壞.*物品"), "損壞他人物品罪"),
     (re.compile(r"贓物"), "贓物罪"),
     (re.compile(r"竊錄|妨害秘密"), "妨害秘密罪"),
-    (re.compile(r"(?:持有|寄藏).*(?:槍枝|手槍|子彈|空氣槍|槍砲.*零件|爆裂物)"), "槍砲罪"),
+    (re.compile(r"(?:持有|寄藏|製造).*(?:槍枝|手槍|子彈|空氣槍|槍砲.*零件|爆裂物)"), "槍砲罪"),
     (re.compile(r"未經許可.*刀械|非法.*刀械"), "非法持有刀械罪"),
     (re.compile(r"妨害公眾往來安全"), "妨害公眾往來安全罪"),
     (re.compile(r"公共場所聚集三人以上|聚集三人以上.*強暴"), "聚眾施強暴罪"),
@@ -116,6 +117,7 @@ CHARGE_RULES = (
     (re.compile(r"妨害醫事人員"), "妨害醫事人員執行業務罪"),
     (re.compile(r"偽造.*(?:紙幣|通用貨幣)"), "偽造貨幣罪"),
     (re.compile(r"重傷"), "重傷罪"),
+    (re.compile(r"重婚"), "重婚罪"),
     (re.compile(r"媒介.*猥褻|猥褻.*(?:媒介|容留)"), "妨害風化罪"),
     (re.compile(r"選舉.*(?:賄賂|交付)|交付賄賂"), "選舉賄賂罪"),
     (re.compile(r"發還股款"), "未繳納股款罪"),
@@ -144,22 +146,30 @@ def split_labels(value: object) -> list[str]:
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
-# 只保留前十個常見法的正式名稱與主條號；指代詞只承接同列前一個白名單法規。
+# 將單一明載法條收旂為前三個常見法的標準主條號。
+def normalize_law_label(raw: object) -> str:
+    """標準化單一法條；不推定「同法／該條例」的指涉。"""
+    compact = re.sub(r"\s+", "", str(raw or ""))
+    compact = re.sub(r"^(?:(?:中華民國|修正前|修正後|前開)+)", "", compact)
+    law_match = next(
+        ((law, match) for law in COMMON_LAWS
+         if (match := re.search(rf"{re.escape(law)}第", compact))
+         and not (law == "刑法" and compact[max(0, match.start() - 4):match.start()] == "陸海空軍")),
+        None,
+    )
+    if not law_match:
+        return ""
+    name, explicit_match = law_match
+    match = ARTICLE_RE.search(compact, explicit_match.start())
+    return f'{name}第{chinese_number(match.group("article"))}條' if match else ""
+
+
+# 只保留前三個常見法的明載名稱與主條號。
 def normalize_law_levels(value: object) -> tuple[str, str]:
     normalized: list[str] = []
-    previous_name = ""
     for raw in split_labels(value):
-        compact = re.sub(r"\s+", "", raw)
-        compact = re.sub(r"^(?:(?:中華民國|修正前|修正後|前開)+)", "", compact)
-        name = next((law for law in COMMON_LAWS if compact.startswith(f"{law}第")), "")
-        if not name and previous_name and any(word in compact for word in ("同法", "該法", "同條例", "該條例")):
-            name = previous_name
-        match = ARTICLE_RE.search(compact)
-        if not name or not match:
-            continue
-        previous_name = name
-        law = f'{name}第{chinese_number(match.group("article"))}條'
-        if law not in normalized:
+        law = normalize_law_label(raw)
+        if law and law not in normalized:
             normalized.append(law)
     if not normalized:
         return "", ""
@@ -167,11 +177,18 @@ def normalize_law_levels(value: object) -> tuple[str, str]:
     return labels, labels
 
 
-# 以明確的犯罪家族規則移除細節前綴；任一罪名未命中時整格留空，避免高估成功率。
+# 以明確的犯罪家族規則標準化單一罪名；未遂只保留在原始罪名。
+def normalize_charge(charge: object) -> str:
+    """回傳不區分既遂、未遂的單一罪名粗分類；未命中時留空。"""
+    text = str(charge or "").strip()
+    return next((label for pattern, label in CHARGE_RULES if pattern.search(text)), "")
+
+
+# 舊版整格介面保留全有全無語意，對齊新欄位改用 normalize_charge。
 def normalize_charges(value: object) -> str:
     normalized: list[str] = []
     for charge in split_labels(value):
-        standard = next((label for pattern, label in CHARGE_RULES if pattern.search(charge)), "")
+        standard = normalize_charge(charge)
         if not standard:
             return ""
         if standard not in normalized:
@@ -224,10 +241,10 @@ def normalize_workbook(source: Path, output: Path) -> int:
     return target.max_row - 1
 
 
-# 執行最小自我檢查，涵蓋常見法白名單、指代承接及常見罪名粗分類。
+# 執行最小自我檢查，涵蓋常見法白名單、非開頭法名及常見罪名粗分類。
 def self_check() -> None:
     assert normalize_law_levels("[刑法第一百八十五條之三第1項,同法第339條之4]") == (
-        "[刑法第185條,刑法第339條]", "[刑法第185條,刑法第339條]"
+        "[刑法第185條]", "[刑法第185條]"
     )
     assert normalize_law_levels(
         "[中華民國刑法第參佰貳拾條第1項,修正前刑法第320條]"
@@ -235,9 +252,13 @@ def self_check() -> None:
         "[刑法第320條]", "[刑法第320條]"
     )
     assert normalize_law_levels("[刑事訴訟法第158條]") == ("", "")
-    assert normalize_law_levels("[前開商標法第95條第1項]") == (
-        "[商標法第95條]", "[商標法第95條]"
+    assert normalize_law_levels(
+        "[㈱按甲基安非他命為毒品危害防制條例第2條第2項第2款,同條例第10條第2項]"
+    ) == (
+        "[毒品危害防制條例第2條]", "[毒品危害防制條例第2條]"
     )
+    assert normalize_law_levels("[依陸海空軍刑法第54條第1項]") == ("", "")
+    assert normalize_law_levels("[前開商標法第95條第1項]") == ("", "")
     assert normalize_law_levels("[]") == ("", "")
     assert normalize_charges("[三人以上共同詐欺取財未遂罪,攜帶兇器竊盜罪]") == (
         "[詐欺罪,竊盜罪]"

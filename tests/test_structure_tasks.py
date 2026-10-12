@@ -7,6 +7,7 @@ structure_tasks.py 及其合併、標準化後處理的離線測試。
 self_check() 接進 pytest，再補今天實際修過的兩個 bug 的回歸測試。
 """
 
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -17,21 +18,75 @@ from openpyxl import Workbook, load_workbook
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from merge import merge_workbooks  # noqa: E402
-from normalize import normalize_law_levels  # noqa: E402
+from export_structured_db import create_views, import_main_sheet  # noqa: E402
+from normalize import normalize_charges, normalize_law_levels  # noqa: E402
 from structure_tasks import (  # noqa: E402
     chinese_number,
     extract_charges,
+    extract_execution_fines,
     extract_laws,
+    extract_offense_clauses,
     extract_sentences,
+    matched_laws,
     main_section,
+    resolve_law_references,
+    sentence_months,
+    sentence_to_months,
     self_check,
 )
+
+
+class TestParagraphLocalLawReferences(unittest.TestCase):
+    """承前法名只能在同一編號大點內指向前方最近的完整法名。"""
+
+    LAWS = {"刑法", "刑事訴訟法", "毒品危害防制條例", "槍砲彈藥刀械管制條例"}
+
+    def test_reference_uses_nearest_compatible_law_in_same_point(self):
+        """同條例取最近條例，不取更遠的刑法。"""
+        text = (
+            "㈠刑法第11條，毒品危害防制條例第2條第2項，"
+            "同條例第10條第2項之施用第二級毒品罪。"
+        )
+        resolved = resolve_law_references(text, self.LAWS)
+        self.assertIn("毒品危害防制條例第10條第2項", resolved)
+
+    def test_reference_does_not_cross_numbered_point(self):
+        """新大點沒有完整法名時，不沿用上一大點的法名。"""
+        text = "㈠毒品危害防制條例第2條。㈡前開條例第10條第2項。"
+        resolved = resolve_law_references(text, self.LAWS)
+        self.assertIn("㈡前開條例第10條第2項", resolved)
+
+    def test_narrative_ending_in_reference_is_not_a_law_name(self):
+        """「再犯該條例」不能反過來被當成完整法名。"""
+        text = (
+            "（二）毒品危害防制條例第20條規定，若5年後再犯該條例第10條。"
+        )
+        resolved = resolve_law_references(text, self.LAWS)
+        self.assertIn("毒品危害防制條例第10條", resolved)
 
 
 class TestSelfCheck(unittest.TestCase):
     def test_self_check_passes(self):
         """把既有的 self_check() 斷言接進 CI，而不是只能手動執行才會跑到。"""
         self_check()
+
+
+class TestSentenceMonths(unittest.TestCase):
+    """有期徒刑與拘役共用月數欄，但拘役仍保留日數換算的小數精度。"""
+
+    def test_detention_days_are_converted_to_months(self):
+        """拘役按 30 日一月換算，避免短期拘役被誤記成 0 或缺值。"""
+        self.assertEqual(sentence_to_months("拘役拾日"), 0.33)
+        self.assertEqual(sentence_to_months("拘役貳拾日"), 0.67)
+        self.assertEqual(sentence_to_months("拘役參拾日"), 1.0)
+        self.assertEqual(sentence_to_months("拘役伍拾日"), 1.67)
+        self.assertEqual(sentence_months(["拘役拾日", "拘役參拾日"]), ["0.33", "1"])
+
+    def test_other_sentence_types_stay_without_month_value(self):
+        """死刑、無期徒刑與罰金仍不硬塞進有限月數。"""
+        self.assertIsNone(sentence_to_months("死刑"))
+        self.assertIsNone(sentence_to_months("無期徒刑"))
+        self.assertIsNone(sentence_to_months("罰金新臺幣壹萬元"))
 
 
 class TestChineseNumberCommaAmount(unittest.TestCase):
@@ -44,8 +99,53 @@ class TestChineseNumberCommaAmount(unittest.TestCase):
 
     def test_comma_amount_is_recognized_as_a_sentence(self):
         declared, executions = extract_sentences("甲犯竊盜罪，處罰金新臺幣30,000元。")
-        self.assertEqual(declared, ["罰金新臺幣30,000元"])
+        self.assertEqual(declared, [])
         self.assertEqual(executions, [])
+        self.assertEqual(
+            extract_offense_clauses("甲犯竊盜罪，處罰金新臺幣30,000元。")[0]["fine"],
+            "罰金新臺幣30,000元",
+        )
+
+
+class TestAlignedOffenseExtraction(unittest.TestCase):
+    """罪名、主刑與罰金必須保留相同的主文順序。"""
+
+    def test_primary_and_fine_are_separate_and_aligned(self):
+        """併科罰金另存罰金，易科罰金不是宣告罰金。"""
+        verdict = (
+            "甲犯竊盜罪，處有期徒刑參月，如易科罰金，以新臺幣壹仟元折算壹日；"
+            "又犯侵占罪，處有期徒刑陸月，併科罰金新臺幣壹萬元。"
+        )
+        offenses = extract_offense_clauses(verdict, "甲")
+        self.assertEqual([item["charge"] for item in offenses], ["竊盜罪", "侵占罪"])
+        self.assertEqual([item["primary"] for item in offenses], ["有期徒刑參月", "有期徒刑陸月"])
+        self.assertEqual([item["fine"] for item in offenses], ["", "罰金新臺幣壹萬元"])
+        self.assertEqual(extract_execution_fines("應執行罰金新臺幣貳萬元。"), ["罰金新臺幣貳萬元"])
+
+    def test_execution_and_compound_fine_do_not_become_charge(self):
+        """應執行刑與併科罰金不能提供罪名描述起點。"""
+        verdict = "應執行有期徒刑拾捌年，併科罰金新臺幣壹億元。"
+        self.assertEqual(extract_offense_clauses(verdict), [])
+
+    def test_standalone_fine_still_locates_charge_description(self):
+        """獨立科罰金是單罪宣告刑，仍可用來定位罪名。"""
+        offenses = extract_offense_clauses("甲竊盜，科罰金新臺幣貳仟元。", "甲")
+        self.assertEqual([item["charge"] for item in offenses], ["竊盜"])
+        self.assertEqual([item["fine"] for item in offenses], ["罰金新臺幣貳仟元"])
+
+    def test_law_falls_back_only_to_passage_containing_same_charge(self):
+        """主文無法條時，只取理由中同時出現該罪名的定罪法條。"""
+        reason = "核被告所為，係犯刑法第320條第1項之竊盜罪。另係犯刑法第335條第1項之侵占罪。"
+        laws, source = matched_laws("竊盜罪", "竊盜罪", "", reason, "", "")
+        self.assertEqual(laws, ["刑法第320條第1項"])
+        self.assertEqual(source, "理由")
+
+    def test_law_uses_case_fallback_after_charge_match_fails(self):
+        """罪名配對失敗時，取案件層級定罪法條並明確標記備援來源。"""
+        applicable = "毒品危害防制條例第10條第2項"
+        laws, source = matched_laws("施用第二級毒品", "施用毒品罪", "", "", "", applicable)
+        self.assertEqual(laws, ["毒品危害防制條例第10條第2項"])
+        self.assertEqual(source, "案件法條備援")
 
 
 class TestLawRESingleCharName(unittest.TestCase):
@@ -89,6 +189,38 @@ class TestVerdictBoundaries(unittest.TestCase):
         verdict = "犯詐欺取財罪，共貳罪，各處有期徒刑參月。"
         self.assertEqual(extract_charges(verdict, ""), ["詐欺取財罪"])
 
+    def test_recidivist_and_charge_count_suffix_is_removed(self):
+        """罪數前夾有「均累犯」時，也不可併入原始罪名。"""
+        verdict = "甲共同犯填製不實罪，均累犯，共參罪，各處有期徒刑參月。"
+        self.assertEqual(extract_charges(verdict, ""), ["填製不實罪"])
+
+    def test_common_two_and_recidivist_order_are_supported(self):
+        """「兩」與「均累犯」不得迫使正則向後吞掉其他罪名。"""
+        verdict = (
+            "甲犯竊盜罪，共兩罪，均累犯，各處有期徒刑參月；"
+            "又犯攜帶兇器竊盜罪，處有期徒刑伍月。"
+        )
+        self.assertEqual(extract_charges(verdict, ""), ["竊盜罪", "攜帶兇器竊盜罪"])
+
+    def test_variant_financial_three_is_a_charge_count(self):
+        """「叄」是參的異體大寫，不得連同「共叄罪」併入罪名。"""
+        verdict = "甲犯不當性交罪，共叄罪，各處有期徒刑參月。"
+        self.assertEqual(extract_charges(verdict, ""), ["不當性交罪"])
+
+    def test_main_description_without_commit_or_charge_word(self):
+        """主文未寫「犯／罪」時，仍可擷取被告名後至宣告刑前的描述。"""
+        verdict = "陳某吐氣所含酒精濃度達0.25毫克以上而駕駛動力交通工具，累犯，處有期徒刑伍月。"
+        self.assertEqual(
+            extract_charges(verdict, "", defendants="陳某"),
+            ["吐氣所含酒精濃度達0.25毫克以上而駕駛動力交通工具"],
+        )
+
+    def test_attempt_is_kept_in_main_description(self):
+        """原始罪名保留未遂，標準類別與既遂合併。"""
+        verdict = "甲殺人未遂，處有期徒刑伍年。"
+        self.assertEqual(extract_charges(verdict, "", defendants="甲"), ["殺人未遂"])
+        self.assertEqual(normalize_charges("[殺人未遂罪]"), "[殺人罪]")
+
 
 class TestLawFallback(unittest.TestCase):
     """理由只含程序法時，必須繼續向事實與適用法條補抓。"""
@@ -114,8 +246,21 @@ class TestNormalizeLawName(unittest.TestCase):
         """正式法名前的版本詞不影響標準化。"""
         self.assertEqual(
             normalize_law_levels("[修正前刑法第320條,前開商標法第95條]"),
-            ("[刑法第320條,商標法第95條]", "[刑法第320條,商標法第95條]"),
+            ("[刑法第320條]", "[刑法第320條]"),
         )
+
+    def test_explicit_law_need_not_start_label(self):
+        """明載的白名單法名可位於論述中，但「同條例」不自動承接。"""
+        self.assertEqual(
+            normalize_law_levels(
+                "[㈱按甲基安非他命為毒品危害防制條例第2條第2項,同條例第10條第2項]"
+            ),
+            ("[毒品危害防制條例第2條]", "[毒品危害防制條例第2條]"),
+        )
+
+    def test_other_criminal_code_does_not_match_criminal_code(self):
+        """陸海空軍刑法不可因內含「刑法」二字而被誤納入白名單。"""
+        self.assertEqual(normalize_law_levels("[依陸海空軍刑法第54條]"), ("", ""))
 
 
 class TestMergeDeduplication(unittest.TestCase):
@@ -139,6 +284,35 @@ class TestMergeDeduplication(unittest.TestCase):
             values = list(workbook["裁判書資料"].values)
             self.assertEqual(values[1:], [("u1", "A"), ("u2", "B"), ("u3", "C")])
             workbook.close()
+
+
+class TestStructuredDatabaseViews(unittest.TestCase):
+    """Datasette Views 必須與 Excel 的空值定義一致。"""
+
+    def test_empty_string_and_empty_list_are_missing(self):
+        """空字串與 [] 都應進入原始缺值 View，不可被當成有值。"""
+        headers = [
+            "裁判書連結", "案件結果", "被告狀態", "主文",
+            "罪名（原始）", "罪名（標準化）", "法條（對應原始）", "法條（對應標準鍵）",
+            "宣告主刑", "宣告主刑（月）", "應執行刑", "應執行刑（月）",
+            "單一刑期來源", "刑期資料狀態", "原始缺值欄位", "標準化缺值欄位",
+            "刑期月數缺值欄位", "刑期原始缺值欄位",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "structured.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "罪法刑"
+            sheet.append(headers)
+            sheet.append(["u1", "有罪", "單被告", "甲犯竊盜罪", "[\"竊盜罪\"]", "[\"竊盜罪\"]", "[[]]", "[[]]", "[\"\"]", "[\"\"]", "[]", "[]", "", "無刑罰", "法", "", "", "宣告刑、應執行刑"])
+            sheet.append(["u2", "有罪", "單被告", "乙犯竊盜罪", "[\"竊盜罪\"]", "[\"\"]", "[[\"刑法第320條\"]]", "[[\"\"]]", "[\"拘役30日\"]", "[\"\"]", "[]", "[]", "宣告刑", "僅宣告主刑", "", "罪、法", "宣告刑", "應執行刑"])
+            workbook.save(source)
+            workbook.close()
+            with sqlite3.connect(":memory:") as connection:
+                self.assertEqual(import_main_sheet(source, connection), 2)
+                create_views(connection)
+                self.assertEqual(connection.execute('SELECT count(*) FROM "罪法_原始無值"').fetchone()[0], 1)
+                self.assertEqual(connection.execute('SELECT count(*) FROM "罪法_有值但標準化無值"').fetchone()[0], 1)
 
 
 if __name__ == "__main__":

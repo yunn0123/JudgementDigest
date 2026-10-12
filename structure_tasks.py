@@ -12,7 +12,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 SOURCE_SHEET = "裁判書資料"
 OUTPUT_SHEET = "罪法刑結構化"
 NON_GUILTY_WORDS = ("無罪", "不受理", "免訴")
-NUM = "零〇○一二三四五六七八九十百千萬億壹貳參叁肆伍陸柒捌玖拾佰仟0123456789"
+NUM = "零〇○一二兩三四五六七八九十百千萬億壹貳參叁叄肆伍陸柒捌玖拾佰仟0123456789"
 # {1,18} 允許單字法律名（民法、刑法）：{2,18} 會要求「法／條例」前至少 2 字，
 # 「民法」「刑法」只有 1 字前綴，永遠比對不到（容嫣於 PR #4 留言回報，appendix_parser
 # 的 _LAW_PREFIX 已用同樣理由改過）。lazy 量詞會優先取最短，不會因此多抓到
@@ -25,22 +25,49 @@ LAW_RE = re.compile(
 CHARGE_AFTER_LAW_RE = re.compile(r"之?([^，、；。]{2,80}罪)(?=[，、；。]|$)")
 VERDICT_CHARGE_RE = re.compile(
     r"(?<!罪)犯(?!罪事實)([^；。]{2,160}?罪)"
-    rf"(?=，(?:共?[{NUM}]+罪，)?(?:(?:累犯|未遂)，)?(?:均處|各處|處|科|免刑)|[；。]|$)"
+    rf"(?=，(?:共?[{NUM}]+罪，)?(?:(?:(?:均)?累犯|未遂)，)?(?:均處|各處|處|科|免刑)|[；。]|$)"
 )
+CHARGE_COUNT_SUFFIX_RE = re.compile(rf"，(?:(?:均)?累犯，)?共?[{NUM}]+罪$")
 APPENDIX_REFERENCE_RE = re.compile(r"^(?:(?:如|本).{0,12})?附表")
 MAIN_END_RE = re.compile(r"(?:犯罪事實及理由|事實及理由|事實與理由|犯罪事實)(?!欄|要旨)")
+LAW_POINT_RE = re.compile(
+    r"(?=(?:[㈠㈡㈢㈣㈤㈥㈦㈧㈨㈩]|[（(][一二三四五六七八九十]+[）)]|"
+    r"[一二三四五六七八九十]+、))"
+)
+LAW_REFERENCE_NAMES = (
+    "同條例", "前開條例", "上述條例", "上開條例", "該條例", "本條例", "前揭條例", "前述條例",
+    "同法", "前開法", "上述法", "上開法", "該法", "本法", "前揭法", "前述法",
+)
+LAW_REFERENCE_RE = re.compile(
+    rf"(?P<reference>{'|'.join(map(re.escape, LAW_REFERENCE_NAMES))})"
+    rf"(?P<article>第[{NUM}]+條(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?)"
+)
+EXPLICIT_LAW_RE = re.compile(
+    rf"(?P<name>[^，。；、：: （）()\s]{{1,30}}?(?:條例|法))(?=第[{NUM}]+條)"
+)
 # 罰金金額允許千分位逗號，但不併入 NUM，避免法條條號誤接受逗號。
 TOTAL_RE = re.compile(
     rf"應執(?:行|刑)(?:之刑為)?(死刑|無期徒刑|有期徒(?:刑)?[{NUM}]+年(?:[{NUM}]+月)?|"
     rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM},]+元)"
 )
+# 主刑與罰金分欄時，主刑只保留死刑、無期、有期與拘役。
+TOTAL_PRIMARY_RE = re.compile(
+    rf"應執(?:行|刑)(?:之刑為)?(死刑|無期徒刑|有期徒(?:刑)?[{NUM}]+年(?:[{NUM}]+月)?|"
+    rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日)"
+)
+TOTAL_FINE_RE = re.compile(rf"應執(?:行|刑)(?:之刑為)?(罰金(?:新臺幣)?[{NUM},]+元)")
 SINGLE_RE = re.compile(
     rf"(?<!易)(?:處|科)(死刑|無期徒刑|有期徒(?:刑)?[{NUM}]+年(?:[{NUM}]+月)?|"
     rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日|罰金(?:新臺幣)?[{NUM},]+元)"
 )
+PRIMARY_RE = re.compile(
+    rf"(?<!易)(?:處|科)(死刑|無期徒刑|有期徒(?:刑)?[{NUM}]+年(?:[{NUM}]+月)?|"
+    rf"有期徒(?:刑)?[{NUM}]+月|拘役[{NUM}]+日)"
+)
+FINE_RE = re.compile(rf"(?<!易)(?:處|科|併科)(罰金(?:新臺幣)?[{NUM},]+元)")
 CN_DIGITS = {
-    "零": 0, "〇": 0, "○": 0, "一": 1, "壹": 1, "二": 2, "貳": 2,
-    "三": 3, "參": 3, "叁": 3, "四": 4, "肆": 4, "五": 5, "伍": 5,
+    "零": 0, "〇": 0, "○": 0, "一": 1, "壹": 1, "二": 2, "兩": 2, "貳": 2,
+    "三": 3, "參": 3, "叁": 3, "叄": 3, "四": 4, "肆": 4, "五": 5, "伍": 5,
     "六": 6, "陸": 6, "七": 7, "柒": 7, "八": 8, "捌": 8,
     "九": 9, "玖": 9,
 }
@@ -99,6 +126,45 @@ def unique(values):
     return list(dict.fromkeys(value for value in values if value))
 
 
+# 在同一編號大點內將「同法／前開條例」回指至前方最近的完整法名。
+def resolve_law_references(text: str, law_names) -> str:
+    """只在 ㈠／（一）／一、等同一大點內解析承前指稱，不跨段推測。"""
+    known_names = sorted(set(law_names), key=len, reverse=True)
+    resolved_points = []
+    for point in LAW_POINT_RE.split(compact(text)):
+        tokens = []
+        for match in EXPLICIT_LAW_RE.finditer(point):
+            raw_name = match.group("name")
+            if any(raw_name.endswith(reference) for reference in LAW_REFERENCE_NAMES):
+                continue
+            recognized = next((name for name in known_names if raw_name.endswith(name)), "")
+            tokens.append((match.start(), "law", recognized, raw_name, match))
+        for match in LAW_REFERENCE_RE.finditer(point):
+            tokens.append((match.start(), "reference", match.group("reference"), "", match))
+        tokens.sort(key=lambda token: (token[0], token[1] == "reference"))
+
+        previous_laws = []
+        replacements = []
+        for _, kind, value, raw_name, match in tokens:
+            if kind == "law":
+                # 未識別的法名仍會阻斷向更遠處回指，避免跨過最近候選誤配。
+                previous_laws.append((raw_name.endswith("條例"), value))
+                continue
+            wants_regulation = value.endswith("條例")
+            referent = next(
+                (name for is_regulation, name in reversed(previous_laws)
+                 if is_regulation == wants_regulation),
+                "",
+            )
+            if referent:
+                replacements.append((match.start(), match.end(), referent + match.group("article")))
+                previous_laws.append((wants_regulation, referent))
+        for start, end, replacement in reversed(replacements):
+            point = point[:start] + replacement + point[end:]
+        resolved_points.append(point)
+    return "".join(resolved_points)
+
+
 # 以使用者指定的 [A,B,C] 文字格式寫入多標籤欄位。
 def labels(values) -> str:
     return "[" + ",".join(unique(values)) + "]"
@@ -149,14 +215,49 @@ def extract_laws(reason: str, applicable_laws: str, facts: str = "") -> list[str
     return unique(found)
 
 
-# 主文只接受明載「犯○○罪」的結果，附表引用不是罪名。
+# 主文優先接受明載「犯○○罪」的結果，並移除罪數與累犯尾碼。
 def extract_verdict_charges(verdict: str) -> list[str]:
     charges = VERDICT_CHARGE_RE.findall(main_section(verdict))
     return unique(
-        charge.removeprefix("共同") for charge in charges
+        CHARGE_COUNT_SUFFIX_RE.sub("", charge).removeprefix("共同") for charge in charges
         if not APPENDIX_REFERENCE_RE.match(charge)
         and not any(marker in charge for marker in ("，處", "沒收", "罪所得新臺幣", "無罪", "免訴", "不受理"))
     )
+
+
+# 主文未寫「犯」或「罪」時，以被告名後、宣告刑前的文字作為罪名描述。
+# 併科、易科與應執行不是單罪宣告刑起點；附表引用與程序性主文也不收。
+def extract_verdict_descriptions(verdict: str, defendants: str = "") -> list[str]:
+    descriptions = []
+    names = sorted((name for name in re.split(r"[；;]", defendants) if name), key=len, reverse=True)
+    for clause in re.split(r"[。；]", main_section(verdict)):
+        if re.match(r"\s*應執(?:行|刑)", clause):
+            continue
+        primary = PRIMARY_RE.search(clause)
+        standalone_fine = re.search(rf"(?<![易併])(?:處|科)罰金(?:新臺幣)?[{NUM},]+元", clause)
+        sentence = min(
+            (match for match in (primary, standalone_fine) if match),
+            key=lambda match: match.start(),
+            default=None,
+        )
+        if not sentence:
+            continue
+        description = clause[:sentence.start()].rstrip("，,均各")
+        description = description.removeprefix("又").removeprefix("另").removeprefix("被告")
+        changed = True
+        while changed:
+            changed = False
+            for name in names:
+                if description.startswith(name):
+                    description = description[len(name):].lstrip("、，,")
+                    changed = True
+        description = re.sub(rf"，(?:均)?累犯(?:，共?[{NUM}]+罪)?$", "", description)
+        description = re.sub(rf"，共?[{NUM}]+罪$", "", description)
+        if (len(description) >= 2
+                and not APPENDIX_REFERENCE_RE.match(description)
+                and not any(word in description for word in ("如附表", "無罪", "免訴", "不受理", "撤銷", "駁回"))):
+            descriptions.append(description)
+    return unique(descriptions)
 
 
 # 輔助文字從已命中的法條結尾定位罪名，避免罪名內的「之」造成截斷。
@@ -172,19 +273,100 @@ def extract_supporting_charges(text: str) -> list[str]:
     return unique(charge.removeprefix("共同") for charge in charges if charge)
 
 
-# 罪名以主文為準；主文沒有具體罪名時，才依序退回理由與事實欄位。
-def extract_charges(verdict: str, reason: str, facts: str = "") -> list[str]:
+# 罪名以主文為準；主文沒有可用描述時，才依序退回理由與事實欄位。
+def extract_charges(verdict: str, reason: str, facts: str = "", defendants: str = "") -> list[str]:
     return (extract_verdict_charges(verdict)
+            or extract_verdict_descriptions(verdict, defendants)
             or extract_supporting_charges(reason)
             or extract_supporting_charges(facts))
 
 
-# 分開保留所有宣告刑與明載的應執行刑，不推算或加總法院未諭知的執行刑。
+# 從單一文字片段取出實體法條，排除程序法與施行法。
+def laws_in_text(text: str) -> list[str]:
+    """保留片段內明載法條的出現順序。"""
+    return unique(
+        law for match in LAW_RE.finditer(text)
+        if not (law := clean_law(match)).startswith(("刑事訴訟法", "刑法施行法"))
+    )
+
+
+# 理由、事實與適用法條只在同一片段同時出現罪名時才可用來配對。
+def matched_laws(charge: str, standardized: str, main_clause: str,
+                 reason: str, facts: str, applicable_laws: str,
+                 normalizer=None) -> tuple[list[str], str]:
+    """優先回傳同罪名法條，無結果時退回案件層級法條。"""
+    direct = laws_in_text(main_clause)
+    if direct:
+        return direct, "主文同子句"
+    terms = unique(term for term in (charge, standardized, standardized.removesuffix("罪")) if len(term) >= 2)
+    for source_name, text, conclusions_only in (
+        ("理由", reason, True), ("事實", facts, True), ("適用法條", applicable_laws, False),
+    ):
+        for passage in re.split(r"[。；]", text):
+            related_by_text = any(term in passage for term in terms)
+            related_by_class = bool(
+                normalizer and standardized
+                and any(normalizer(candidate) == standardized for candidate in charges_after_laws(passage))
+            )
+            if not (related_by_text or related_by_class) or "罪" not in passage:
+                continue
+            if conclusions_only and not any(marker in passage for marker in ("係犯", "違反", "犯")):
+                continue
+            laws = laws_in_text(passage)
+            if laws:
+                return laws, source_name
+    fallback = extract_laws(reason, applicable_laws, facts)
+    if fallback:
+        return fallback, "案件法條備援"
+    return [], ""
+
+
+# 從已定位法條後取出罪名，供正式罪名與粗分類交叉比對。
+def charges_after_laws(text: str) -> list[str]:
+    """回傳同一片段內法條後明載的罪名。"""
+    charges = []
+    for law_match in LAW_RE.finditer(text):
+        charge_match = CHARGE_AFTER_LAW_RE.match(text, law_match.end())
+        if charge_match:
+            charges.append(charge_match.group(1).removeprefix("共同"))
+    return unique(charges)
+
+
+# 以主文罪刑子句為單位，保留罪名、主刑與罰金的相同索引。
+def extract_offense_clauses(verdict: str, defendants: str = "") -> list[dict[str, str]]:
+    """將主文依出現順序拆成可對齊的罪刑紀錄。"""
+    offenses = []
+    for clause in re.split(r"[。；]", main_section(verdict)):
+        charges = extract_verdict_charges(clause) or extract_verdict_descriptions(clause, defendants)
+        if not charges:
+            continue
+        primaries = [normalize_sentence(value) for value in PRIMARY_RE.findall(clause)]
+        fines = FINE_RE.findall(clause)
+        size = max(len(charges), len(primaries), len(fines), 1)
+        if len(charges) == 1 and size > 1:
+            charges *= size
+        for index, charge in enumerate(charges):
+            offenses.append({
+                "charge": charge,
+                "primary": primaries[index] if index < len(primaries) else "",
+                "fine": fines[index] if index < len(fines) else "",
+                "clause": clause,
+            })
+    return offenses
+
+
+# 分開保留所有宣告主刑與明載的應執行主刑，罰金由專用欄位處理。
 def extract_sentences(verdict: str) -> tuple[list[str], list[str]]:
     verdict = main_section(verdict)
-    declared = [normalize_sentence(value) for value in SINGLE_RE.findall(verdict)]
-    executions = [normalize_sentence(value) for value in TOTAL_RE.findall(verdict)]
+    declared = [normalize_sentence(value) for value in PRIMARY_RE.findall(verdict)]
+    executions = [normalize_sentence(value) for value in TOTAL_PRIMARY_RE.findall(verdict)]
     return declared, executions
+
+
+# 應執行罰金屬案件層級，不硬配到單一罪名。
+def extract_execution_fines(verdict: str) -> list[str]:
+    """取出主文明載的應執行罰金。"""
+    return TOTAL_FINE_RE.findall(main_section(verdict))
 
 
 # 補回少數原文省略的「刑」字，使刑種與月份換算維持一致格式。
@@ -192,27 +374,32 @@ def normalize_sentence(sentence: str) -> str:
     return re.sub(r"^有期徒(?!刑)", "有期徒刑", sentence)
 
 
-# 將單一「有期徒刑…」宣告刑換算成月數；死刑、無期徒刑、拘役與罰金不硬轉成
-# 不相容單位，回傳 None。appendix_parser.py 的附表逐列換算也共用這支，
-# 避免兩邊各自維護一份「年×12+月」的算法而逐漸不一致。
-def sentence_to_months(sentence: str) -> Optional[int]:
-    if not sentence.startswith("有期徒刑"):
-        return None
-    year = re.search(rf"([{NUM}]+)年", sentence)
-    month = re.search(rf"([{NUM}]+)月", sentence)
-    return (chinese_number(year.group(1)) * 12 if year else 0) + (
-        chinese_number(month.group(1)) if month else 0)
+# 將有期徒刑換算成整月、拘役按 30 日一月換算至小數二位；其他刑種回傳 None。
+# appendix_parser.py 也共用這支，避免主文與附表採用不同換算規則。
+def sentence_to_months(sentence: str) -> Optional[Union[int, float]]:
+    if sentence.startswith("拘役"):
+        day = re.search(rf"([{NUM}]+)日", sentence)
+        return round(chinese_number(day.group(1)) / 30, 2) if day else None
+    if sentence.startswith("有期徒刑"):
+        year = re.search(rf"([{NUM}]+)年", sentence)
+        month = re.search(rf"([{NUM}]+)月", sentence)
+        return (chinese_number(year.group(1)) * 12 if year else 0) + (
+            chinese_number(month.group(1)) if month else 0)
+    return None
 
 
-# 將整案的宣告刑清單換算成月，供「總執行刑（月）」欄使用。
+# 將整案的有期徒刑與拘役清單換算成月，保留拘役的小數月數。
 def sentence_months(sentences: list[str]) -> list[str]:
-    return [str(m) for s in sentences if (m := sentence_to_months(s)) is not None]
+    return [f"{m:g}" for s in sentences if (m := sentence_to_months(s)) is not None]
 
 
-# 提供案件層級的最高有期徒刑月份；其他刑種不強制換算為月份。
-def maximum_sentence_months(sentences: list[str]) -> Union[int, str]:
+# 提供案件層級的最高自由刑月份；死刑、無期徒刑與罰金不換算。
+def maximum_sentence_months(sentences: list[str]) -> Union[int, float, str]:
     months = sentence_months(sentences)
-    return max(map(int, months)) if months else ""
+    if not months:
+        return ""
+    maximum = max(map(float, months))
+    return int(maximum) if maximum.is_integer() else maximum
 
 
 # 區分法院明載執行刑、僅有宣告刑及缺少刑期，供模型篩選標籤品質。
@@ -234,7 +421,7 @@ def structure_row(row: dict) -> list[object]:
     applicable_laws = compact(row.get("適用法條"))
     defendants = compact(row.get("被告／相對人"))
     declared, executions = extract_sentences(verdict)
-    charges = extract_charges(verdict, reason, facts)
+    charges = extract_charges(verdict, reason, facts, defendants)
     laws = extract_laws(reason, applicable_laws, facts)
     result = case_result(verdict)
     sentence_status = sentence_data_status(declared, executions, defendants)
@@ -305,7 +492,8 @@ def self_check() -> None:
     )
     assert declared == ["有期徒刑參月", "有期徒刑參月"]
     assert executions == ["有期徒刑壹年貳月"] and sentence_months(executions) == ["14"]
-    assert extract_sentences("甲竊盜，科罰金新臺幣壹萬元。")[0] == ["罰金新臺幣壹萬元"]
+    assert extract_sentences("甲竊盜，科罰金新臺幣壹萬元。")[0] == []
+    assert extract_offense_clauses("甲竊盜，科罰金新臺幣壹萬元。", "甲")[0]["fine"] == "罰金新臺幣壹萬元"
     assert extract_sentences("甲犯竊盜罪，處有期徒陸月。")[0] == ["有期徒刑陸月"]
     assert extract_sentences("應執刑有期徒刑肆年。")[1] == ["有期徒刑肆年"]
     assert extract_sentences(
