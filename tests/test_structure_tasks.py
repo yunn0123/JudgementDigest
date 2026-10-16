@@ -18,8 +18,9 @@ from openpyxl import Workbook, load_workbook
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from merge import merge_workbooks  # noqa: E402
+from build_structured_review import HEADERS, build_row  # noqa: E402
 from export_structured_db import create_views, import_main_sheet  # noqa: E402
-from normalize import normalize_charges, normalize_law_levels  # noqa: E402
+from normalize import normalize_charge, normalize_charges, normalize_law_levels  # noqa: E402
 from structure_tasks import (  # noqa: E402
     chinese_number,
     extract_charges,
@@ -33,6 +34,7 @@ from structure_tasks import (  # noqa: E402
     sentence_months,
     sentence_to_months,
     self_check,
+    structure_row,
 )
 
 
@@ -63,6 +65,22 @@ class TestParagraphLocalLawReferences(unittest.TestCase):
         )
         resolved = resolve_law_references(text, self.LAWS)
         self.assertIn("毒品危害防制條例第10條", resolved)
+
+    def test_elided_article_reuses_nearest_explicit_law_name(self):
+        """「刑法第216條、第210條」的第二個條號應承接同一法名。"""
+        text = "核被告所為，係犯刑法第216條、第210條之行使偽造私文書罪。"
+        resolved = resolve_law_references(text, self.LAWS)
+        self.assertIn("刑法第216條、刑法第210條", resolved)
+
+    def test_applied_article_reuses_nearest_explicit_law_name(self):
+        """「刑法第176條準用第175條」兩條都屬於後續同一正式罪名。"""
+        text = "係犯刑法第176條準用第175條第3項之過失以煤氣炸燬住宅以外之物罪。"
+        resolved = resolve_law_references(text, self.LAWS)
+        self.assertIn("刑法第176條準用刑法第175條第3項", resolved)
+        laws, _ = matched_laws(
+            "過失以煤氣炸燬住宅以外之物罪", "", "", resolved, "", "",
+        )
+        self.assertEqual(laws, ["刑法第176條", "刑法第175條第3項"])
 
 
 class TestSelfCheck(unittest.TestCase):
@@ -133,12 +151,110 @@ class TestAlignedOffenseExtraction(unittest.TestCase):
         self.assertEqual([item["charge"] for item in offenses], ["竊盜"])
         self.assertEqual([item["fine"] for item in offenses], ["罰金新臺幣貳仟元"])
 
+    def test_appendix_object_reference_does_not_discard_offense_clause(self):
+        """罪名中引用附表物品不是「犯如附表所示之罪」，仍須保留罪刑對齊。"""
+        verdict = "甲過失以煤氣炸燬如附表所示之物，致生公共危險，處拘役伍拾日。"
+        offenses = extract_offense_clauses(verdict, "甲")
+        self.assertEqual(len(offenses), 1)
+        self.assertEqual(offenses[0]["primary"], "拘役伍拾日")
+
+    def test_bare_appendix_charge_reference_is_still_discarded(self):
+        """只有「犯如附表所示之罪」而無具體罪名時仍不可建立罪刑對齊。"""
+        self.assertEqual(
+            extract_offense_clauses("甲犯如附表所示之罪，處有期徒刑參月。", "甲"),
+            [],
+        )
+
     def test_law_falls_back_only_to_passage_containing_same_charge(self):
         """主文無法條時，只取理由中同時出現該罪名的定罪法條。"""
         reason = "核被告所為，係犯刑法第320條第1項之竊盜罪。另係犯刑法第335條第1項之侵占罪。"
         laws, source = matched_laws("竊盜罪", "竊盜罪", "", reason, "", "")
         self.assertEqual(laws, ["刑法第320條第1項"])
         self.assertEqual(source, "理由")
+
+    def test_compound_supporting_charges_are_split_and_aligned(self):
+        """「A罪及B法之B罪」應在原始萃取時拆開，且各自只取得相應法條。"""
+        reason = (
+            "被告所為，均係犯刑法第339條第1項之詐欺取財罪及"
+            "洗錢防制法第14條第1項之一般洗錢罪。"
+        )
+        self.assertEqual(extract_charges("", reason), ["詐欺取財罪", "一般洗錢罪"])
+        fraud_laws, _ = matched_laws("詐欺取財罪", "詐欺罪", "", reason, "", "", normalize_charge)
+        laundering_laws, _ = matched_laws("一般洗錢罪", "洗錢罪", "", reason, "", "", normalize_charge)
+        self.assertEqual(fraud_laws, ["刑法第339條第1項"])
+        self.assertEqual(laundering_laws, ["洗錢防制法第14條第1項"])
+
+    def test_separately_committed_marks_a_formal_charge_conclusion(self):
+        """「分別犯」與「係犯」同為正式論罪句型，必須提供罪名與法條。"""
+        reason = (
+            "核被告所為，分別犯刑法第339條之4第1項第2款之三人以上共同詐欺取財罪、"
+            "洗錢防制法第14條第1項之一般洗錢罪。"
+        )
+        self.assertEqual(
+            extract_charges("", reason),
+            ["三人以上共同詐欺取財罪", "一般洗錢罪"],
+        )
+        fraud_laws, _ = matched_laws(
+            "三人以上共同詐欺取財罪", "詐欺罪", "", reason, "", "", normalize_charge,
+        )
+        laundering_laws, _ = matched_laws(
+            "一般洗錢罪", "洗錢罪", "", reason, "", "", normalize_charge,
+        )
+        self.assertEqual(fraud_laws, ["刑法第339條之4第1項第2款"])
+        self.assertEqual(laundering_laws, ["洗錢防制法第14條第1項"])
+
+    def test_exact_raw_charge_precedes_standardized_charge_fallback(self):
+        """同一粗分類下有不同罪名時，原始罪名精確配對不可混入另一罪的法條。"""
+        reason = (
+            "核被告所為，各係犯毒品危害防制條例第11條第1項之持有第一級毒品罪、"
+            "毒品危害防制條例第11條第2項之持有第二級毒品罪。"
+        )
+        first_laws, _ = matched_laws(
+            "持有第一級毒品罪", "持有毒品罪", "", reason, "", "", normalize_charge,
+        )
+        second_laws, _ = matched_laws(
+            "持有第二級毒品罪", "持有毒品罪", "", reason, "", "", normalize_charge,
+        )
+        self.assertEqual(first_laws, ["毒品危害防制條例第11條第1項"])
+        self.assertEqual(second_laws, ["毒品危害防制條例第11條第2項"])
+
+    def test_multiple_laws_before_one_charge_do_not_absorb_next_charge_law(self):
+        """同罪的第216、210條應成組，後續詐欺罪第339條不可混入前罪。"""
+        reason = resolve_law_references(
+            "核被告所為，係犯刑法第216條、第210條之行使偽造私文書罪、"
+            "同法第339條第1項之詐欺取財罪。",
+            {"刑法"},
+        )
+        forgery_laws, _ = matched_laws(
+            "行使偽造私文書罪", "偽造文書罪", "", reason, "", "", normalize_charge,
+        )
+        fraud_laws, _ = matched_laws(
+            "詐欺取財罪", "詐欺罪", "", reason, "", "", normalize_charge,
+        )
+        self.assertEqual(forgery_laws, ["刑法第216條", "刑法第210條"])
+        self.assertEqual(fraud_laws, ["刑法第339條第1項"])
+
+    def test_elided_article_after_another_charge_stays_with_its_own_charge(self):
+        """後罪省略法名時仍應獨立配對，不併入前一個洗錢罪。"""
+        reason = resolve_law_references(
+            "核被告所為，係犯洗錢防制法第14條第1項之洗錢罪及"
+            "刑法第339條之4第1項第2款之三人以上共同詐欺取財罪、"
+            "第339條之2第1項之非法由自動付款設備取財罪。",
+            {"刑法", "洗錢防制法"},
+        )
+        laundering_laws, _ = matched_laws(
+            "洗錢罪", "洗錢罪", "", reason, "", "", normalize_charge,
+        )
+        fraud_laws, _ = matched_laws(
+            "三人以上共同詐欺取財罪", "詐欺罪", "", reason, "", "", normalize_charge,
+        )
+        atm_laws, _ = matched_laws(
+            "非法由自動付款設備取財罪", "自動付款設備詐欺罪", "", reason, "", "",
+            normalize_charge,
+        )
+        self.assertEqual(laundering_laws, ["洗錢防制法第14條第1項"])
+        self.assertEqual(fraud_laws, ["刑法第339條之4第1項第2款"])
+        self.assertEqual(atm_laws, ["刑法第339條之2第1項"])
 
     def test_law_uses_case_fallback_after_charge_match_fails(self):
         """罪名配對失敗時，取案件層級定罪法條並明確標記備援來源。"""
@@ -221,6 +337,34 @@ class TestVerdictBoundaries(unittest.TestCase):
         self.assertEqual(extract_charges(verdict, "", defendants="甲"), ["殺人未遂"])
         self.assertEqual(normalize_charges("[殺人未遂罪]"), "[殺人罪]")
 
+    def test_hit_and_run_precedes_injury(self):
+        """含「傷害」的交通事故逃逸罪名仍應優先歸入肇事逃逸類別。"""
+        self.assertEqual(
+            normalize_charge("駕駛動力交通工具發生交通事故，致人傷害逃逸罪"),
+            "肇事逃逸罪",
+        )
+
+    def test_drug_impaired_driving_precedes_alcohol_driving(self):
+        """服用毒品致不能安全駕駛不應被較廣的「不能安全駕駛」酒駕規則攔截。"""
+        self.assertEqual(
+            normalize_charge("服用毒品致不能安全駕駛動力交通工具罪"),
+            "毒駕罪",
+        )
+
+    def test_specific_charge_rules_precede_broad_categories(self):
+        """具體罪名不得被妨害名譽、妨害公務、傷害或公共危險等上位分類攔截。"""
+        cases = {
+            "侮辱公務員罪": "侮辱公務員罪",
+            "對於公務員依法執行職務時，當場侮辱": "侮辱公務員罪",
+            "公然侮辱罪": "妨害名譽罪",
+            "重傷害未遂罪": "重傷罪",
+            "放火燒燬他人所有物致生公共危險罪": "放火罪",
+            "以不正方法利用自動付款設備詐欺取財罪": "不正利用自動設備罪",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_charge(raw), expected)
+
 
 class TestLawFallback(unittest.TestCase):
     """理由只含程序法時，必須繼續向事實與適用法條補抓。"""
@@ -233,6 +377,15 @@ class TestLawFallback(unittest.TestCase):
             "核其所為，係犯刑法第320條第1項之竊盜罪。",
         )
         self.assertEqual(laws, ["刑法第320條第1項"])
+
+    def test_duplicate_appendix_laws_collapse_to_most_specific_citation(self):
+        """全文標題、程序法及同條簡略引文不得污染案件法條備援。"""
+        applicable = (
+            "中華民國刑法第185條之3。刑法第185條之3第1項第1款。"
+            "依刑事訴訟法第451條第1項。"
+            "附錄本案所犯法條全文中華民國刑法第185條之3。"
+        )
+        self.assertEqual(extract_laws("", applicable), ["刑法第185條之3第1項第1款"])
 
 
 class TestNormalizeLawName(unittest.TestCase):
@@ -313,6 +466,49 @@ class TestStructuredDatabaseViews(unittest.TestCase):
                 create_views(connection)
                 self.assertEqual(connection.execute('SELECT count(*) FROM "罪法_原始無值"').fetchone()[0], 1)
                 self.assertEqual(connection.execute('SELECT count(*) FROM "罪法_有值但標準化無值"').fetchone()[0], 1)
+
+
+class TestSingleSentenceDerivation(unittest.TestCase):
+    """模型用單一刑期只能由已輸出的應執行刑或逐罪宣告主刑衍生。"""
+
+    def test_aligned_single_primary_becomes_single_sentence(self):
+        """一罪一宣告主刑可轉成單一刑期及月數。"""
+        row, _ = build_row({
+            "裁判字號": "測試", "被告／相對人": "甲", "裁判種類": "判決",
+            "案件類型": "測試", "主文": "甲竊盜，處拘役伍拾日。",
+            "事實及理由": "核被告所為，係犯刑法第320條第1項之竊盜罪。",
+        })
+        values = dict(zip(HEADERS, row))
+        self.assertEqual(values["宣告主刑"], '["拘役伍拾日"]')
+        self.assertEqual(values["單一刑期"], '["拘役伍拾日"]')
+        self.assertEqual(values["單一刑期（月）"], '["1.67"]')
+
+    def test_legacy_sheet_uses_the_same_aligned_laws_as_review_sheet(self):
+        """舊工作表也要解析「同法」並輸出與新版審核表相同的定罪法條。"""
+        source = {
+            "裁判字號": "測試", "被告／相對人": "甲", "裁判種類": "判決",
+            "案件類型": "測試", "主文": "甲犯幫助詐欺取財罪，處有期徒刑參月。",
+            "事實及理由": "核被告所為，係犯刑法第30條第1項、同法第339條第1項之幫助詐欺取財罪。",
+        }
+        legacy = structure_row(source)
+        review, _ = build_row(source)
+        values = dict(zip(HEADERS, review))
+        self.assertEqual(legacy[5], "[刑法第30條第1項,刑法第339條第1項]")
+        self.assertEqual(legacy[6], "[幫助詐欺取財罪]")
+        self.assertEqual(values["法條（對應原始）"], '[["刑法第30條第1項","刑法第339條第1項"]]')
+
+    def test_single_appendix_sentence_uses_single_formal_supporting_charge(self):
+        """附表罪名與理由正式罪名皆唯一時，可將主文刑期安全地補回同一罪。"""
+        row, _ = build_row({
+            "裁判字號": "測試", "被告／相對人": "甲", "裁判種類": "判決",
+            "案件類型": "測試", "主文": "甲犯如附表所示之罪，處拘役伍拾日。",
+            "事實及理由": "核被告所為，係犯刑法第320條第1項之竊盜罪。",
+        })
+        values = dict(zip(HEADERS, row))
+        self.assertEqual(values["罪名（原始）"], '["竊盜罪"]')
+        self.assertEqual(values["宣告主刑"], '["拘役伍拾日"]')
+        self.assertEqual(values["單一刑期"], '["拘役伍拾日"]')
+        self.assertEqual(values["單一刑期（月）"], '["1.67"]')
 
 
 if __name__ == "__main__":

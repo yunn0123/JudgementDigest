@@ -7,6 +7,7 @@ from typing import Optional, Union
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from structuring import LAW_ALIASES, LAW_WHITELIST
 
 
 SOURCE_SHEET = "裁判書資料"
@@ -18,18 +19,20 @@ NUM = "零〇○一二兩三四五六七八九十百千萬億壹貳參叁叄肆�
 # 的 _LAW_PREFIX 已用同樣理由改過）。lazy 量詞會優先取最短，不會因此多抓到
 # 「應依」等觸發詞殘留。
 LAW_RE = re.compile(
-    rf"(?:係犯|共同犯|違反|適用|應依|依|按|犯|、|，|；|^)"
+    rf"(?:係犯|共同犯|違反|適用|應依|依|按|犯|準用|及|與|暨|、|，|；|^)"
     rf"([^，、；。：（）()\s]{{1,18}}?(?:條例|法))第[{NUM}]+條"
     rf"(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?"
 )
+LAW_ID_RE = re.compile(rf"^(.+?(?:條例|法))第([{NUM}]+)條(?:之([{NUM}]+))?")
 CHARGE_AFTER_LAW_RE = re.compile(r"之?([^，、；。]{2,80}罪)(?=[，、；。]|$)")
 VERDICT_CHARGE_RE = re.compile(
     r"(?<!罪)犯(?!罪事實)([^；。]{2,160}?罪)"
     rf"(?=，(?:共?[{NUM}]+罪，)?(?:(?:(?:均)?累犯|未遂)，)?(?:均處|各處|處|科|免刑)|[；。]|$)"
 )
 CHARGE_COUNT_SUFFIX_RE = re.compile(rf"，(?:(?:均)?累犯，)?共?[{NUM}]+罪$")
-APPENDIX_REFERENCE_RE = re.compile(r"^(?:(?:如|本).{0,12})?附表")
+APPENDIX_REFERENCE_RE = re.compile(r"^(?:犯)?(?:(?:如|本).{0,12})?附表")
 MAIN_END_RE = re.compile(r"(?:犯罪事實及理由|事實及理由|事實與理由|犯罪事實)(?!欄|要旨)")
+CONCLUSION_CHARGE_RE = re.compile(r"(?:分別係犯|分別犯|係犯|各犯|均犯)")
 LAW_POINT_RE = re.compile(
     r"(?=(?:[㈠㈡㈢㈣㈤㈥㈦㈧㈨㈩]|[（(][一二三四五六七八九十]+[）)]|"
     r"[一二三四五六七八九十]+、))"
@@ -38,8 +41,15 @@ LAW_REFERENCE_NAMES = (
     "同條例", "前開條例", "上述條例", "上開條例", "該條例", "本條例", "前揭條例", "前述條例",
     "同法", "前開法", "上述法", "上開法", "該法", "本法", "前揭法", "前述法",
 )
+LAW_REFERENCE_DICTIONARY = set(LAW_WHITELIST) | set(LAW_ALIASES) | {
+    "刑法", "毒品危害防制條例", "洗錢防制法",
+}
 LAW_REFERENCE_RE = re.compile(
     rf"(?P<reference>{'|'.join(map(re.escape, LAW_REFERENCE_NAMES))})"
+    rf"(?P<article>第[{NUM}]+條(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?)"
+)
+ELIDED_LAW_ARTICLE_RE = re.compile(
+    rf"(?P<connector>[、，及與暨]|準用)"
     rf"(?P<article>第[{NUM}]+條(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?)"
 )
 EXPLICIT_LAW_RE = re.compile(
@@ -141,6 +151,8 @@ def resolve_law_references(text: str, law_names) -> str:
             tokens.append((match.start(), "law", recognized, raw_name, match))
         for match in LAW_REFERENCE_RE.finditer(point):
             tokens.append((match.start(), "reference", match.group("reference"), "", match))
+        for match in ELIDED_LAW_ARTICLE_RE.finditer(point):
+            tokens.append((match.start(), "elided", match.group("article"), "", match))
         tokens.sort(key=lambda token: (token[0], token[1] == "reference"))
 
         previous_laws = []
@@ -149,6 +161,14 @@ def resolve_law_references(text: str, law_names) -> str:
             if kind == "law":
                 # 未識別的法名仍會阻斷向更遠處回指，避免跨過最近候選誤配。
                 previous_laws.append((raw_name.endswith("條例"), value))
+                continue
+            if kind == "elided":
+                referent = next((name for _, name in reversed(previous_laws) if name), "")
+                if referent:
+                    replacements.append((
+                        match.start(), match.end(), match.group("connector") + referent + value,
+                    ))
+                    previous_laws.append((referent.endswith("條例"), referent))
                 continue
             wants_regulation = value.endswith("條例")
             referent = next(
@@ -193,9 +213,39 @@ def case_result(verdict: str) -> str:
 # 清掉法條前被正則一併捕捉的論述文字，只留下法規名稱與條項。
 def clean_law(match: re.Match) -> str:
     name = match.group(1)
-    for marker in ("係犯", "共同犯", "違反", "適用", "應依", "該罪為", "無論以", "均係"):
+    for marker in (
+        "分別係犯", "分別犯", "係犯", "共同犯", "違反", "適用", "應依", "依",
+        "該罪為", "無論以", "均係",
+    ):
         name = name.rsplit(marker, 1)[-1]
+    name = re.sub(r"^(?:附錄本案所犯法條全文)?(?:中華民國)?", "", name)
     return name + match.group(0).split(match.group(1), 1)[1]
+
+
+# 同一法條的全文標題、主條與詳細條項只留最精確版本；不同項款不互相覆蓋。
+def specific_substantive_laws(laws: list[str]) -> list[str]:
+    """排除程序／施行法，並將同一法條的簡略重複值收斂為最詳細引文。"""
+    kept: list[str] = []
+    for law in laws:
+        if any(excluded in law for excluded in ("刑事訴訟法", "刑法施行法")):
+            continue
+        match = LAW_ID_RE.match(law)
+        identity = match.groups() if match else None
+        replaced = False
+        for index, existing in enumerate(kept):
+            existing_match = LAW_ID_RE.match(existing)
+            if not identity or not existing_match or existing_match.groups() != identity:
+                continue
+            if existing == law or existing.startswith(law):
+                replaced = True
+                break
+            if law.startswith(existing):
+                kept[index] = law
+                replaced = True
+                break
+        if not replaced:
+            kept.append(law)
+    return kept
 
 
 # 依理由、事實、適用法條的順序找法條，先命中即停止，避免較弱來源混入。
@@ -204,12 +254,12 @@ def extract_laws(reason: str, applicable_laws: str, facts: str = "") -> list[str
     for text, conclusions_only in ((reason, True), (facts, True), (applicable_laws, False)):
         passages = [
             sentence for sentence in re.split(r"[。；]", text)
-            if not conclusions_only or "係犯" in sentence or ("違反" in sentence and "罪" in sentence)
+            if not conclusions_only or CONCLUSION_CHARGE_RE.search(sentence)
+            or ("違反" in sentence and "罪" in sentence)
         ]
-        found = [
-            law for passage in passages for match in LAW_RE.finditer(passage)
-            if not (law := clean_law(match)).startswith(("刑事訴訟法", "刑法施行法"))
-        ]
+        found = specific_substantive_laws([
+            clean_law(match) for passage in passages for match in LAW_RE.finditer(passage)
+        ])
         if found:
             break
     return unique(found)
@@ -255,7 +305,7 @@ def extract_verdict_descriptions(verdict: str, defendants: str = "") -> list[str
         description = re.sub(rf"，共?[{NUM}]+罪$", "", description)
         if (len(description) >= 2
                 and not APPENDIX_REFERENCE_RE.match(description)
-                and not any(word in description for word in ("如附表", "無罪", "免訴", "不受理", "撤銷", "駁回"))):
+                and not any(word in description for word in ("無罪", "免訴", "不受理", "撤銷", "駁回"))):
             descriptions.append(description)
     return unique(descriptions)
 
@@ -264,12 +314,9 @@ def extract_verdict_descriptions(verdict: str, defendants: str = "") -> list[str
 def extract_supporting_charges(text: str) -> list[str]:
     charges = []
     for sentence in re.split(r"[。；]", text):
-        if "係犯" not in sentence and not ("違反" in sentence and "罪" in sentence):
+        if not CONCLUSION_CHARGE_RE.search(sentence) and not ("違反" in sentence and "罪" in sentence):
             continue
-        for law_match in LAW_RE.finditer(sentence):
-            charge_match = CHARGE_AFTER_LAW_RE.match(sentence, law_match.end())
-            if charge_match:
-                charges.append(charge_match.group(1))
+        charges.extend(charge for _, charge in law_charge_pairs(sentence))
     return unique(charge.removeprefix("共同") for charge in charges if charge)
 
 
@@ -284,10 +331,7 @@ def extract_charges(verdict: str, reason: str, facts: str = "", defendants: str 
 # 從單一文字片段取出實體法條，排除程序法與施行法。
 def laws_in_text(text: str) -> list[str]:
     """保留片段內明載法條的出現順序。"""
-    return unique(
-        law for match in LAW_RE.finditer(text)
-        if not (law := clean_law(match)).startswith(("刑事訴訟法", "刑法施行法"))
-    )
+    return specific_substantive_laws([clean_law(match) for match in LAW_RE.finditer(text)])
 
 
 # 理由、事實與適用法條只在同一片段同時出現罪名時才可用來配對。
@@ -303,14 +347,25 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
         ("理由", reason, True), ("事實", facts, True), ("適用法條", applicable_laws, False),
     ):
         for passage in re.split(r"[。；]", text):
+            if (conclusions_only and not CONCLUSION_CHARGE_RE.search(passage)
+                    and not ("違反" in passage and "罪" in passage)):
+                continue
+            pairs = law_charge_pairs(passage)
+            exact_laws = unique(
+                law for law, candidate in pairs if compact(candidate) == compact(charge)
+            )
+            paired_laws = exact_laws or unique(
+                law for law, candidate in pairs
+                if normalizer and standardized and normalizer(candidate) == standardized
+            )
+            if paired_laws:
+                return paired_laws, source_name
             related_by_text = any(term in passage for term in terms)
             related_by_class = bool(
                 normalizer and standardized
                 and any(normalizer(candidate) == standardized for candidate in charges_after_laws(passage))
             )
             if not (related_by_text or related_by_class) or "罪" not in passage:
-                continue
-            if conclusions_only and not any(marker in passage for marker in ("係犯", "違反", "犯")):
                 continue
             laws = laws_in_text(passage)
             if laws:
@@ -322,14 +377,29 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
 
 
 # 從已定位法條後取出罪名，供正式罪名與粗分類交叉比對。
-def charges_after_laws(text: str) -> list[str]:
-    """回傳同一片段內法條後明載的罪名。"""
-    charges = []
-    for law_match in LAW_RE.finditer(text):
-        charge_match = CHARGE_AFTER_LAW_RE.match(text, law_match.end())
+def law_charge_pairs(text: str) -> list[tuple[str, str]]:
+    """把罪名前連續法條歸給該罪，並在下一個罪名後重新開始配對。"""
+    pairs = []
+    pending_laws = []
+    law_matches = list(LAW_RE.finditer(text))
+    for index, law_match in enumerate(law_matches):
+        law = clean_law(law_match)
+        if not law.startswith(("刑事訴訟法", "刑法施行法")):
+            pending_laws.append(law)
+        segment_end = law_matches[index + 1].start() if index + 1 < len(law_matches) else len(text)
+        segment = text[law_match.end():segment_end].rstrip("及與暨")
+        charge_match = CHARGE_AFTER_LAW_RE.match(segment)
         if charge_match:
-            charges.append(charge_match.group(1).removeprefix("共同"))
-    return unique(charges)
+            charge = charge_match.group(1).removeprefix("共同")
+            pairs.extend((law, charge) for law in pending_laws)
+            pending_laws = []
+    return pairs
+
+
+# 將法條後明載的罪名提供給粗分類比對，複合句已由 law_charge_pairs 分開。
+def charges_after_laws(text: str) -> list[str]:
+    """回傳同一片段內各法條所對應的明載罪名。"""
+    return unique(charge for _, charge in law_charge_pairs(text))
 
 
 # 以主文罪刑子句為單位，保留罪名、主刑與罰金的相同索引。
@@ -353,6 +423,49 @@ def extract_offense_clauses(verdict: str, defendants: str = "") -> list[dict[str
                 "clause": clause,
             })
     return offenses
+
+
+# 讓舊工作表與精簡審核表共用罪刑對齊、承前法名及同罪名法條配對規則。
+def extract_aligned_case(verdict: str, reason: str, facts: str, applicable_laws: str,
+                         defendants: str, declared: list[str], normalizer):
+    """回傳逐罪的主文罪刑、對應法條及來源；無主文罪名時才以理由備援。"""
+    reason = resolve_law_references(reason, LAW_REFERENCE_DICTIONARY)
+    facts = resolve_law_references(facts, LAW_REFERENCE_DICTIONARY)
+    applicable_laws = resolve_law_references(applicable_laws, LAW_REFERENCE_DICTIONARY)
+    offenses = extract_offense_clauses(verdict, defendants)
+    charge_source = "主文" if offenses else ""
+    supporting_charges = extract_supporting_charges(reason) or extract_supporting_charges(facts)
+    if offenses and len(supporting_charges) == len(offenses):
+        replaced = False
+        for offense, supporting_charge in zip(offenses, supporting_charges):
+            if "罪" not in offense["charge"]:
+                offense["charge"] = supporting_charge
+                replaced = True
+        if replaced:
+            charge_source = "主文罪刑＋理由／事實正式罪名"
+    if (not offenses and len(supporting_charges) == 1 and len(declared) == 1
+            and "如附表" in verdict):
+        offenses = [{
+            "charge": supporting_charges[0], "primary": declared[0], "fine": "", "clause": verdict,
+        }]
+        charge_source = "主文刑期＋理由／事實正式罪名"
+    if not offenses:
+        fallback_charges = supporting_charges or extract_charges("", reason, facts, defendants)
+        offenses = [{"charge": charge, "primary": "", "fine": "", "clause": ""}
+                    for charge in fallback_charges]
+        charge_source = "理由／事實備援" if offenses else ""
+
+    laws_by_offense = []
+    law_sources = []
+    for offense in offenses:
+        charge = offense["charge"]
+        laws, source_name = matched_laws(
+            charge, normalizer(charge), offense["clause"], reason, facts,
+            applicable_laws, normalizer,
+        )
+        laws_by_offense.append(laws)
+        law_sources.append(source_name)
+    return offenses, laws_by_offense, charge_source, law_sources
 
 
 # 分開保留所有宣告主刑與明載的應執行主刑，罰金由專用欄位處理。
@@ -415,14 +528,19 @@ def sentence_data_status(declared: list[str], executions: list[str], defendants:
 
 # 結合主文、理由與適用法條，產生單一案件的一列結構化資料。
 def structure_row(row: dict) -> list[object]:
+    from normalize import normalize_charge
+
     verdict = compact(row.get("主文"))
     reason = compact(row.get("事實及理由")) + compact(row.get("理由"))
     facts = compact(row.get("事實")) + compact(row.get("犯罪事實"))
     applicable_laws = compact(row.get("適用法條"))
     defendants = compact(row.get("被告／相對人"))
     declared, executions = extract_sentences(verdict)
-    charges = extract_charges(verdict, reason, facts, defendants)
-    laws = extract_laws(reason, applicable_laws, facts)
+    offenses, laws_by_offense, _, _ = extract_aligned_case(
+        verdict, reason, facts, applicable_laws, defendants, declared, normalize_charge,
+    )
+    charges = [offense["charge"] for offense in offenses]
+    laws = unique(law for offense_laws in laws_by_offense for law in offense_laws)
     result = case_result(verdict)
     sentence_status = sentence_data_status(declared, executions, defendants)
     status = "完整" if declared or executions else "無刑期"

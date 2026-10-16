@@ -1,4 +1,4 @@
-"""Build the canonical compact XLSX review file from raw 2018–2023 judgments."""
+"""Build the compact criminal-judgment review workbook from raw exported judgments."""
 
 import argparse
 import json
@@ -10,20 +10,16 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font, PatternFill
 
-from normalize import COMMON_LAWS, normalize_charge, normalize_law_label
+from normalize import normalize_charge, normalize_law_label
 from structure_tasks import (
     case_result,
     compact,
-    extract_charges,
+    extract_aligned_case,
     extract_execution_fines,
-    extract_offense_clauses,
     extract_sentences,
-    matched_laws,
-    resolve_law_references,
     sentence_months,
     sentence_to_months,
 )
-from structuring import LAW_ALIASES, LAW_WHITELIST
 
 
 SOURCE_SHEET = "裁判書資料"
@@ -40,9 +36,6 @@ HEADERS = (
     "刑期資料狀態", "萃取狀態", "原始缺值欄位", "標準化缺值欄位",
     "刑期月數缺值欄位", "刑期原始缺值欄位",
 )
-LAW_REFERENCE_DICTIONARY = set(LAW_WHITELIST) | set(LAW_ALIASES) | set(COMMON_LAWS)
-
-
 # Empty strings and serialized empty lists both represent missing extraction values.
 def has_value(value: object) -> bool:
     """Return whether an exported field contains a usable value."""
@@ -88,41 +81,26 @@ def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
     reason = compact(source.get("事實及理由")) + compact(source.get("理由"))
     facts = compact(source.get("事實")) + compact(source.get("犯罪事實"))
     applicable_laws = compact(source.get("適用法條"))
-    reason = resolve_law_references(reason, LAW_REFERENCE_DICTIONARY)
-    facts = resolve_law_references(facts, LAW_REFERENCE_DICTIONARY)
-    applicable_laws = resolve_law_references(applicable_laws, LAW_REFERENCE_DICTIONARY)
     defendants = compact(source.get("被告／相對人"))
     defendant_status = classify_defendants(defendants, verdict)
     declared, executions = extract_sentences(verdict)
     execution_fines = extract_execution_fines(verdict)
-    offenses = extract_offense_clauses(verdict, defendants)
-    charge_source = "主文" if offenses else ""
-    if not offenses:
-        fallback_charges = extract_charges("", reason, facts, defendants)
-        offenses = [{"charge": charge, "primary": "", "fine": "", "clause": ""} for charge in fallback_charges]
-        charge_source = "理由／事實備援" if offenses else ""
-
+    offenses, raw_laws, charge_source, law_sources = extract_aligned_case(
+        verdict, reason, facts, applicable_laws, defendants, declared, normalize_charge,
+    )
     raw_charges = [offense["charge"] for offense in offenses]
     standard_charges = [normalize_charge(charge) for charge in raw_charges]
-    raw_laws = []
-    standard_laws = []
-    law_sources = []
-    for offense, charge, standard in zip(offenses, raw_charges, standard_charges):
-        laws, source_name = matched_laws(
-            charge, standard, offense["clause"], reason, facts, applicable_laws, normalize_charge,
-        )
-        raw_laws.append(laws)
-        standard_laws.append([normalize_law_label(law) for law in laws])
-        law_sources.append(source_name)
+    standard_laws = [[normalize_law_label(law) for law in laws] for laws in raw_laws]
     primaries = [offense["primary"] for offense in offenses]
     primary_months = [sentence_to_months(sentence) or "" if sentence else "" for sentence in primaries]
     fines = [offense["fine"] for offense in offenses]
     result = case_result(verdict)
 
+    # 單一刑期只能由輸出欄位衍生，不得另用全文刑期結果繞過罪刑對齊。
     if len(executions) == 1:
         selected, sentence_source = executions, "應執行刑"
-    elif not executions and len(declared) == 1:
-        selected, sentence_source = declared, "宣告刑"
+    elif not executions and len(primaries) == 1 and primaries[0]:
+        selected, sentence_source = primaries, "宣告刑"
     else:
         selected, sentence_source = [], ""
     risk = "多被告且單一應執行刑，可能只對應部分被告" if defendant_status == "多被告" and len(executions) == 1 else ""
