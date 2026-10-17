@@ -366,6 +366,58 @@ class TestVerdictBoundaries(unittest.TestCase):
                 self.assertEqual(normalize_charge(raw), expected)
 
 
+class TestMissingChargeGroups(unittest.TestCase):
+    def test_fraud_property_descriptions_and_attempts(self):
+        for raw in (
+            "幫助意圖為自己不法之所有，以詐術使人將本人之物交付",
+            "共同意圖為自己不法之所有，以詐術使人將本人之物交付未遂罪",
+            "意圖為自己不法之所有，以詐術得財產上不法之利益",
+            "詐術取財罪",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_charge(raw), "詐欺罪")
+
+    def test_deception_without_property_does_not_imply_fraud(self):
+        self.assertEqual(normalize_charge("以詐術使人施用毒品罪"), "施用毒品罪")
+        self.assertEqual(normalize_charge("以詐術招募他人加入犯罪組織罪"), "組織犯罪罪")
+        self.assertEqual(normalize_charge("詐術"), "")
+
+    def test_securities_manipulation_and_fraud_remain_separate(self):
+        for raw, expected in (
+            ("證券交易法第一百七十一條第一項第一款之高買低賣證券罪", "操縱證券交易價格罪"),
+            ("證券交易法第一百七十一條第二項之高買證券罪", "操縱證券交易價格罪"),
+            ("幫助犯操縱證券交易價格罪", "操縱證券交易價格罪"),
+            ("證券交易法第一百七十一條第一項第一款之詐偽罪", "證券詐偽罪"),
+            ("非法經營證券業務罪", "非法經營證券業務罪"),
+            ("非法經營期貨業務罪", "非法經營期貨業務罪"),
+            ("證券交易法第一百七十一條", ""),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_charge(raw), expected)
+
+    def test_sexual_images_do_not_absorb_child_images_or_nonsexual_recordings(self):
+        for raw, expected in (
+            ("無故攝錄他人性影像罪", "妨害性隱私及不實性影像罪"),
+            ("無故攝錄他人性影像未遂罪", "妨害性隱私及不實性影像罪"),
+            ("未經他人同意無故散布其性影像", "妨害性隱私及不實性影像罪"),
+            ("製作不實性影像罪", "妨害性隱私及不實性影像罪"),
+            ("拍攝少年性影像罪", "兒少性剝削罪"),
+            ("以違反本人意願之方法使少年被拍攝性影像罪", "兒少性剝削罪"),
+            ("持有未滿十八歲之人性影像罪", "兒少性剝削罪"),
+            ("對於14歲以上未滿16歲之男子為性交罪及兒童及少年性剝削防制條例第36條第3項之以違反本人意願之方法使少年被拍攝性影像罪",
+             "與未成年人性交猥褻罪"),
+            ("竊錄身體隱私部位罪", "妨害秘密罪"),
+            ("於投票所以攝影器材刺探選舉人圈選選舉票內容", ""),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_charge(raw), expected)
+
+    def test_new_charge_groups_work_in_list_interface(self):
+        self.assertEqual(normalize_charges(
+            "[詐術取財罪,無故攝錄他人性影像罪,無故攝錄他人性影像未遂罪,高買證券罪]"
+        ), "[詐欺罪,妨害性隱私及不實性影像罪,操縱證券交易價格罪]")
+
+
 class TestLawFallback(unittest.TestCase):
     """理由只含程序法時，必須繼續向事實與適用法條補抓。"""
 
@@ -389,10 +441,38 @@ class TestLawFallback(unittest.TestCase):
 
 
 class TestNormalizeLawName(unittest.TestCase):
-    """常見法只在清理前綴後從開頭比對，避免子字串誤命中。"""
+    """跨法律逐條篩選，保留完整名稱並避免子字串誤命中。"""
+
+    def test_added_articles_accept_chinese_numbers_and_subdivisions(self):
+        for raw, key in (
+            ("組織犯罪防制條例第三條第1項", "組織犯罪防制條例第3條"),
+            ("商業會計法第七十一條第1款", "商業會計法第71條"),
+            ("商標法第97條第1項", "商標法第97條"),
+            ("家庭暴力防治法第61條第1款", "家庭暴力防治法第61條"),
+            ("性騷擾防治法第25條第1項", "性騷擾防治法第25條"),
+            ("個人資料保護法第41條", "個人資料保護法第41條"),
+            ("藥事法第83條第1項", "藥事法第83條"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_law_levels(f"[{raw}]"), (f"[{key}]", f"[{key}]"))
+
+    def test_excluded_articles_and_unselected_articles_stay_empty(self):
+        for raw in (
+            "道路交通管理處罰條例第86條", "組織犯罪防制條例第2條",
+            "組織犯罪防制條例第12條", "商標法第999條", "藥事法第999條",
+            "公司法第999條", "刑法第130條",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_law_levels(f"[{raw}]"), ("", ""))
+
+    def test_mixed_list_deduplicates_and_skips_exclusions(self):
+        self.assertEqual(
+            normalize_law_levels("[刑法第132條,組織犯罪防制條例第2條,商標法第97條,商標法第九十七條]"),
+            ("[刑法第132條,商標法第97條]", "[刑法第132條,商標法第97條]"),
+        )
 
     def test_enforcement_act_is_not_criminal_code(self):
-        """刑法施行法不可正規化成刑法。"""
+        """低頻刑法施行法不可誤命中入選的刑法第1條。"""
         self.assertEqual(normalize_law_levels("[中華民國刑法施行法第1條之1]"), ("", ""))
 
     def test_known_prefixes_are_removed_before_matching(self):
@@ -412,8 +492,9 @@ class TestNormalizeLawName(unittest.TestCase):
         )
 
     def test_other_criminal_code_does_not_match_criminal_code(self):
-        """陸海空軍刑法不可因內含「刑法」二字而被誤納入白名單。"""
-        self.assertEqual(normalize_law_levels("[依陸海空軍刑法第54條]"), ("", ""))
+        """陸海空軍刑法入選後不可被截成刑法。"""
+        self.assertEqual(normalize_law_levels("[依陸海空軍刑法第54條]"),
+                         ("[陸海空軍刑法第54條]", "[陸海空軍刑法第54條]"))
 
 
 class TestMergeDeduplication(unittest.TestCase):
