@@ -334,6 +334,11 @@ def laws_in_text(text: str) -> list[str]:
     return specific_substantive_laws([clean_law(match) for match in LAW_RE.finditer(text)])
 
 
+def charge_name_key(charge: str) -> str:
+    """只移除名稱尾端的罪／罪嫌，保留罪名本身及未遂等區別。"""
+    return re.sub(r"罪(?:嫌)?$", "", compact(charge).removeprefix("共同"))
+
+
 # 理由、事實與適用法條只在同一片段同時出現罪名時才可用來配對。
 def matched_laws(charge: str, standardized: str, main_clause: str,
                  reason: str, facts: str, applicable_laws: str,
@@ -342,6 +347,7 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
     direct = laws_in_text(main_clause)
     if direct:
         return direct, "主文同子句"
+    excluded_laws = set()
     terms = unique(term for term in (charge, standardized, standardized.removesuffix("罪")) if len(term) >= 2)
     for source_name, text, conclusions_only in (
         ("理由", reason, True), ("事實", facts, True), ("適用法條", applicable_laws, False),
@@ -350,9 +356,9 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
             if (conclusions_only and not CONCLUSION_CHARGE_RE.search(passage)
                     and not ("違反" in passage and "罪" in passage)):
                 continue
-            pairs = law_charge_pairs(passage)
+            pairs = law_charge_pairs(passage, charge_hint=charge)
             exact_laws = unique(
-                law for law, candidate in pairs if compact(candidate) == compact(charge)
+                law for law, candidate in pairs if charge_name_key(candidate) == charge_name_key(charge)
             )
             paired_laws = exact_laws or unique(
                 law for law, candidate in pairs
@@ -360,6 +366,10 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
             )
             if paired_laws:
                 return paired_laws, source_name
+            # 已配到其他罪的法條不可因同句出現主文罪名而全部回收。
+            if pairs:
+                excluded_laws.update(laws_in_text(passage))
+                continue
             related_by_text = any(term in passage for term in terms)
             related_by_class = bool(
                 normalizer and standardized
@@ -368,19 +378,30 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
             if not (related_by_text or related_by_class) or "罪" not in passage:
                 continue
             laws = laws_in_text(passage)
-            if laws:
+            if len(laws) == 1:
                 return laws, source_name
+            # 無法拆清多法條與罪名時留空，也不能再由案件備援收回。
+            excluded_laws.update(laws)
     fallback = extract_laws(reason, applicable_laws, facts)
+    fallback = [law for law in fallback if not any(
+        law == excluded or law.startswith(excluded) or excluded.startswith(law)
+        for excluded in excluded_laws
+    )]
     if fallback:
         return fallback, "案件法條備援"
     return [], ""
 
 
 # 從已定位法條後取出罪名，供正式罪名與粗分類交叉比對。
-def law_charge_pairs(text: str) -> list[tuple[str, str]]:
+def law_charge_pairs(text: str, charge_hint: str = "") -> list[tuple[str, str]]:
     """把罪名前連續法條歸給該罪，並在下一個罪名後重新開始配對。"""
     pairs = []
     pending_laws = []
+    # 省略「罪」只用已知主文罪名作錨點，不把法條後任意敘述當新罪名。
+    name = charge_name_key(charge_hint)
+    hinted_charge = re.compile(
+        rf"之?(?:共同)?({re.escape(name)})(?:罪(?:嫌)?)?(?=[，、；。]|$)"
+    ) if len(name) >= 2 else None
     law_matches = list(LAW_RE.finditer(text))
     for index, law_match in enumerate(law_matches):
         law = clean_law(law_match)
@@ -392,6 +413,12 @@ def law_charge_pairs(text: str) -> list[tuple[str, str]]:
         if charge_match:
             charge = charge_match.group(1).removeprefix("共同")
             pairs.extend((law, charge) for law in pending_laws)
+            pending_laws = []
+        elif hinted_charge and hinted_charge.match(segment):
+            pairs.extend((law, charge_hint) for law in pending_laws)
+            pending_laws = []
+        elif not re.fullmatch(r"[，、及與暨]*(?:準用)?", segment):
+            # 遇到未解析的罪名／敘述就停止承接，避免把前罪法條掛到後罪。
             pending_laws = []
     return pairs
 

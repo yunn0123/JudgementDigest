@@ -29,6 +29,7 @@ from structure_tasks import (  # noqa: E402
     extract_offense_clauses,
     extract_sentences,
     matched_laws,
+    law_charge_pairs,
     main_section,
     resolve_law_references,
     sentence_months,
@@ -262,6 +263,72 @@ class TestAlignedOffenseExtraction(unittest.TestCase):
         laws, source = matched_laws("施用第二級毒品", "施用毒品罪", "", "", "", applicable)
         self.assertEqual(laws, ["毒品危害防制條例第10條第2項"])
         self.assertEqual(source, "案件法條備援")
+
+
+class TestOptionalChargeSuffix(unittest.TestCase):
+    def test_omitted_suffix_does_not_take_other_concurrent_offense(self):
+        reason = resolve_law_references(
+            "核被告所為，係犯刑法第140條第1項之侮辱公務員、"
+            "同法第309條第1項之公然侮辱罪嫌。", {"刑法"},
+        )
+        for charge in ("侮辱公務員", "侮辱公務員罪"):
+            with self.subTest(charge=charge):
+                laws, source = matched_laws(
+                    charge, "侮辱公務員罪", "", reason, "", "", normalize_charge,
+                )
+                self.assertEqual(laws, ["刑法第140條第1項"])
+                self.assertEqual(source, "理由")
+        # The accusation suffix may match an already-known main charge; it does
+        # not turn every accusation in supporting text into a convicted charge.
+        laws, _ = matched_laws(
+            "公然侮辱罪", "妨害名譽罪", "", reason, "", "", normalize_charge,
+        )
+        self.assertEqual(laws, ["刑法第309條第1項"])
+
+    def test_full_suffix_matches_main_charge_without_suffix(self):
+        laws, _ = matched_laws(
+            "竊盜", "", "", "核被告所為，係犯刑法第320條第1項之竊盜罪。", "", "",
+        )
+        self.assertEqual(laws, ["刑法第320條第1項"])
+
+    def test_omitted_suffix_matches_main_charge_with_suffix_without_normalizer(self):
+        laws, _ = matched_laws(
+            "竊盜罪", "", "", "核被告所為，係犯刑法第320條第1項之竊盜。", "", "",
+        )
+        self.assertEqual(laws, ["刑法第320條第1項"])
+
+    def test_shared_laws_with_omitted_suffix_remain_grouped(self):
+        reason = resolve_law_references(
+            "核被告所為，係犯刑法第216條、第210條之行使偽造私文書、"
+            "同法第339條第1項之詐欺取財罪。", {"刑法"},
+        )
+        laws, _ = matched_laws("行使偽造私文書罪", "", "", reason, "", "")
+        self.assertEqual(laws, ["刑法第216條", "刑法第210條"])
+
+    def test_unparsed_other_charge_does_not_carry_law_to_next_charge(self):
+        reason = "係犯刑法第140條第1項之侮辱公務員、刑法第309條第1項之公然侮辱罪。"
+        self.assertEqual(law_charge_pairs(reason), [("刑法第309條第1項", "公然侮辱罪")])
+
+    def test_charge_name_is_not_a_substring_match(self):
+        reason = "係犯刑法第277條第2項之傷害致死罪、刑法第354條之毀損罪。"
+        laws, _ = matched_laws("傷害罪", "", "", reason, "", "")
+        self.assertEqual(laws, [])
+
+    def test_ambiguous_multiple_laws_do_not_return_through_case_fallback(self):
+        reason = "係犯刑法第140條、刑法第309條，侮辱公務員罪及公然侮辱罪之配對待確認。"
+        laws, _ = matched_laws("侮辱公務員罪", "侮辱公務員罪", "", reason, "", "")
+        self.assertEqual(laws, [])
+
+    def test_real_case_shape_remains_main_charge_only(self):
+        row, _ = build_row({
+            "裁判字號": "測試", "被告／相對人": "甲",
+            "主文": "甲犯侮辱公務員罪，處拘役參拾日。",
+            "理由": "核被告所為，係犯刑法第140條第1項之侮辱公務員、"
+                    "同法第309條第1項之公然侮辱罪嫌。",
+        })
+        values = dict(zip(HEADERS, row))
+        self.assertEqual(values["罪名（原始）"], '["侮辱公務員罪"]')
+        self.assertEqual(values["法條（對應原始）"], '[["刑法第140條第1項"]]')
 
 
 class TestLawRESingleCharName(unittest.TestCase):
