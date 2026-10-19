@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from law_frequency import extract_law_keys
+from driving_charge import is_driving_charge, driving_charge_kind
 
 
 SOURCE_SHEET = "罪法刑結構化"
@@ -169,7 +170,7 @@ LAW_WHITELIST = frozenset({
 CHARGE_RULES = (
     (re.compile(r"尿液所含毒品|駕駛動力交通工具.*毒品|"
                 r"(?:服用|施用|吸食).*毒品.*(?:不能安全駕駛|駕駛動力交通工具)"), "毒駕罪"),
-    (re.compile(r"酒.*濃度|酒類.*駕駛|不能安全駕駛|第一百八十五條之三"), "酒駕罪"),
+    (re.compile(r"酒.*濃度|酒類.*駕駛"), "酒駕罪"),
     (re.compile(r"過失致重傷"), "過失致重傷罪"),
     (re.compile(r"過失傷害|過失.*(?:受傷|傷害)"), "過失傷害罪"),
     (re.compile(r"過失致死|過失致人於死"), "過失致死罪"),
@@ -328,18 +329,29 @@ def normalize_law_levels(value: object) -> tuple[str, str]:
 def normalize_charge(charge: object) -> str:
     """回傳不區分既遂、未遂的單一罪名粗分類；未命中時留空。"""
     text = str(charge or "").strip()
+    if is_driving_charge(text):
+        return driving_charge_kind(text)
     return next((label for pattern, label in CHARGE_RULES if pattern.search(text)), "")
 
 
 # 舊版整格介面保留全有全無語意，對齊新欄位改用 normalize_charge。
-def normalize_charges(value: object) -> str:
+def normalize_charges(value: object, reason: str = "", facts: str = "") -> str:
+    from structure_tasks import contextual_charge_labels, resolve_law_references, LAW_REFERENCE_DICTIONARY
+
     normalized: list[str] = []
     for charge in split_labels(value):
         standard = normalize_charge(charge)
-        if not standard:
+        standards = [standard] if standard else []
+        if is_driving_charge(charge):
+            standards = contextual_charge_labels(
+                charge, resolve_law_references(reason, LAW_REFERENCE_DICTIONARY),
+                resolve_law_references(facts, LAW_REFERENCE_DICTIONARY), normalize_charge,
+            )
+        if not standards:
             return ""
-        if standard not in normalized:
-            normalized.append(standard)
+        for standard in standards:
+            if standard not in normalized:
+                normalized.append(standard)
     return "[" + ",".join(normalized) + "]" if normalized else ""
 
 
@@ -365,12 +377,24 @@ def normalize_workbook(source: Path, output: Path) -> int:
         "判決書名稱", "法條（原始）", "法條標準鍵", "法條粗分類",
         "罪名（原始）", "罪名（標準化）", "所有宣告刑", "應執行刑",
     ])
+    # 舊工作表仍保留原始罪名；上下文僅從同案且唯一的原始資料列取回。
+    source_rows = {}
+    if "裁判書資料" in workbook.sheetnames:
+        source_values = workbook["裁判書資料"].iter_rows(values_only=True)
+        source_headers = next(source_values, ())
+        for values in source_values:
+            raw = dict(zip(source_headers, values))
+            key = (raw.get("裁判字號"), raw.get("裁判書連結"))
+            source_rows[key] = raw if key not in source_rows else None
     for values in source_sheet.iter_rows(min_row=2, values_only=True):
         row = dict(zip(headers, values))
         standard_laws, coarse_laws = normalize_law_levels(row.get("法條"))
+        raw = source_rows.get((row.get("裁判字號"), row.get("裁判書連結"))) or {}
+        reason = str(raw.get("事實及理由") or "") + str(raw.get("理由") or "")
+        facts = str(raw.get("事實") or "") + str(raw.get("犯罪事實") or "")
         target.append([
             row.get("裁判字號", ""), row.get("法條", ""), standard_laws, coarse_laws,
-            row.get("罪名", ""), normalize_charges(row.get("罪名")),
+            row.get("罪名", ""), normalize_charges(row.get("罪名"), reason, facts),
             row.get("所有宣告刑", ""), row.get("應執行刑", ""),
         ])
 
@@ -421,7 +445,7 @@ def self_check() -> None:
         "[毒駕罪]"
     )
     assert normalize_charges("[不能安全駕駛動力交通工具罪,圖利聚眾賭博罪]") == (
-        "[酒駕罪,賭博罪]"
+        ""
     )
     assert normalize_charges("[商標法第九十七條之非法販賣侵害商標權之商品罪]") == (
         "[侵害商標權罪]"

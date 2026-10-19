@@ -19,6 +19,7 @@ from structure_tasks import (
     extract_sentences,
     sentence_months,
     sentence_to_months,
+    separate_source_fields,
 )
 
 
@@ -35,6 +36,7 @@ HEADERS = (
     "單一刑期", "單一刑期（月）", "單一刑期來源", "單一刑期風險",
     "刑期資料狀態", "萃取狀態", "原始缺值欄位", "標準化缺值欄位",
     "刑期月數缺值欄位", "刑期原始缺值欄位",
+    "罪名（對應標準化）",
 )
 # Empty strings and serialized empty lists both represent missing extraction values.
 def has_value(value: object) -> bool:
@@ -78,8 +80,8 @@ def add_sheet(workbook: Workbook, name: str):
 def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
     """Run extraction and normalization once, returning the row plus filter flags."""
     verdict = compact(source.get("主文"))
-    reason = compact(source.get("事實及理由")) + compact(source.get("理由"))
-    facts = compact(source.get("事實")) + compact(source.get("犯罪事實"))
+    reason, reason_attachments = separate_source_fields((label, source.get(label)) for label in ('事實及理由', '理由'))
+    facts, fact_attachments = separate_source_fields((label, source.get(label)) for label in ('事實', '犯罪事實'))
     applicable_laws = compact(source.get("適用法條"))
     defendants = compact(source.get("被告／相對人"))
     defendant_status = classify_defendants(defendants, verdict)
@@ -87,9 +89,11 @@ def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
     execution_fines = extract_execution_fines(verdict)
     offenses, raw_laws, charge_source, law_sources = extract_aligned_case(
         verdict, reason, facts, applicable_laws, defendants, declared, normalize_charge,
+        reason_attachments + fact_attachments,
     )
     raw_charges = [offense["charge"] for offense in offenses]
-    standard_charges = [normalize_charge(charge) for charge in raw_charges]
+    aligned_charges = [offense["standard_charges"] for offense in offenses]
+    standard_charges = [label for group in aligned_charges for label in (group or [""])]
     standard_laws = [[normalize_law_label(law) for law in laws] for laws in raw_laws]
     primaries = [offense["primary"] for offense in offenses]
     primary_months = [sentence_to_months(sentence) or "" if sentence else "" for sentence in primaries]
@@ -129,7 +133,7 @@ def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
         json_value(executions), json_value(sentence_months(executions)), json_value(execution_fines),
         json_value(selected), json_value(sentence_months(selected)),
         sentence_source, risk, sentence_status, extraction_status,
-        raw_missing, standard_missing, month_missing, sentence_missing,
+        raw_missing, standard_missing, month_missing, sentence_missing, json_value(aligned_charges),
     ]
     denominator = result == "有罪" and defendant_status == "單被告"
     flags = {

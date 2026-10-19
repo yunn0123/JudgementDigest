@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from law_frequency import analyze_database, describe, extract_law_keys, rank_articles
@@ -27,7 +28,7 @@ class TestLawFrequency(unittest.TestCase):
     def test_database_nested_json_and_duplicate_case_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.db"
-            with sqlite3.connect(path) as c:
+            with closing(sqlite3.connect(path)) as c, c:
                 c.execute('CREATE TABLE 罪法刑 (裁判字號 TEXT, "法條（對應原始）" TEXT)')
                 rows = [
                     ("a", [["刑法第320條第1項", "刑法第三百二十條"], ["商標法第97條"]]),

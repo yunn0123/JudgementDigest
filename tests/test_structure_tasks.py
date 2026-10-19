@@ -257,12 +257,12 @@ class TestAlignedOffenseExtraction(unittest.TestCase):
         self.assertEqual(fraud_laws, ["刑法第339條之4第1項第2款"])
         self.assertEqual(atm_laws, ["刑法第339條之2第1項"])
 
-    def test_law_uses_case_fallback_after_charge_match_fails(self):
-        """罪名配對失敗時，取案件層級定罪法條並明確標記備援來源。"""
+    def test_unmatched_charge_does_not_take_case_level_laws(self):
+        """裸法條沒有與主文罪名配對，不以案件層級備援收回。"""
         applicable = "毒品危害防制條例第10條第2項"
         laws, source = matched_laws("施用第二級毒品", "施用毒品罪", "", "", "", applicable)
-        self.assertEqual(laws, ["毒品危害防制條例第10條第2項"])
-        self.assertEqual(source, "案件法條備援")
+        self.assertEqual(laws, [])
+        self.assertEqual(source, "")
 
 
 class TestOptionalChargeSuffix(unittest.TestCase):
@@ -296,6 +296,19 @@ class TestOptionalChargeSuffix(unittest.TestCase):
             "竊盜罪", "", "", "核被告所為，係犯刑法第320條第1項之竊盜。", "", "",
         )
         self.assertEqual(laws, ["刑法第320條第1項"])
+
+    def test_optional_suffix_before_conduct_description_keeps_own_law_group(self):
+        for name in ('竊盜之犯行', '竊盜行為', '竊盜罪之行為'):
+            with self.subTest(name=name):
+                laws, _ = matched_laws(
+                    '竊盜罪', '', '',
+                    f'核被告所為，係犯刑法第320條第1項之{name}、刑法第339條第1項之詐欺罪。',
+                    '', '',
+                )
+                self.assertEqual(laws, ['刑法第320條第1項'])
+        laws, _ = matched_laws('竊盜罪', '', '',
+                              '核被告所為，係犯刑法第320條第3項之竊盜未遂行為。', '', '')
+        self.assertEqual(laws, [])
 
     def test_shared_laws_with_omitted_suffix_remain_grouped(self):
         reason = resolve_law_references(

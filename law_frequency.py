@@ -6,6 +6,7 @@ import re
 import sqlite3
 import statistics
 from collections import Counter, defaultdict
+from contextlib import closing
 from pathlib import Path
 
 from structure_tasks import chinese_number
@@ -89,7 +90,7 @@ def analyze_database(path, top=200, min_cases=30):
     raw_cases = set()
     all_cases = set()
     unmatched = Counter()
-    with sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
         for case, raw in connection.execute('SELECT 裁判字號, "法條（對應原始）" FROM 罪法刑'):
             all_cases.add(case)
             for label in set(flatten_labels(json.loads(raw or "[]"))):
