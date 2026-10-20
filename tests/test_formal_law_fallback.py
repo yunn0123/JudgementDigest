@@ -123,5 +123,14 @@ class TestFormalFallbackGates(unittest.TestCase):
             laws = json.loads(row['法條（對應原始）'])
             self.assertFalse(any('第19條' in law or '第47條' in law for group in laws for law in group))
 
+    def test_new_entry_vocabulary_does_not_expand_legacy_case_fallback(self):
+        # Reduced boundary from 108訴330: a broad entry must not recover confiscation.
+        source = {'被告／相對人': '甲某', '主文': '甲某犯竊盜罪，處拘役拾日。',
+                  '理由': '核其所為，是犯刑法第38條之1第3項之罪。'}
+        row = dict(zip(HEADERS, build_row(source)[0]))
+        self.assertEqual(json.loads(row['法條（對應原始）']), [[]])
+        self.assertEqual(json.loads(row['法條備援紀錄'])[0]['reasons'],
+                         ['legacy_no_match_in_accepted_court_text'])
+
 
 if __name__=='__main__':unittest.main()

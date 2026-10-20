@@ -5,12 +5,15 @@ No Git history or audit snapshot is needed at runtime.
 """
 import re
 import structure_tasks as st
-from structure_tasks import (LAW_RE, CONCLUSION_CHARGE_RE, charge_name_key,
+from structure_tasks import (LAW_RE, charge_name_key,
                              unique, specific_substantive_laws)
 from law_frequency import ALIASES
 from law_label_validation import TRAINING_LAW_RE, training_law_key
 
 CHARGE_AFTER_LAW_RE = re.compile(r"之?([^，、；。]{2,80}罪)(?=[，、；。]|$)")
+# Keep the legacy entry vocabulary; only the confirmed 各犯行 boundary is shared.
+# Broader new entries belong to the precise matcher, not this case-level fallback.
+CONCLUSION_CHARGE_RE = re.compile(r"(?:分別係犯|分別犯|係犯|各犯(?!行(?:時|為|[，。；、]|$))|均犯)")
 
 def clean_law(match: re.Match) -> str:
     name = match.group(1)
