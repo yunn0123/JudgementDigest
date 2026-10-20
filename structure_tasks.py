@@ -33,10 +33,18 @@ VERDICT_CHARGE_RE = re.compile(
 CHARGE_COUNT_SUFFIX_RE = re.compile(rf"，(?:(?:均)?累犯，)?共?[{NUM}]+罪$")
 APPENDIX_REFERENCE_RE = re.compile(r"^(?:犯)?(?:(?:如|本).{0,12})?附表")
 MAIN_END_RE = re.compile(r"(?:犯罪事實及理由|事實及理由|事實與理由|犯罪事實)(?!欄|要旨)")
-CONCLUSION_CHARGE_RE = re.compile(r"(?:分別係犯|分別犯|[係是](?:幫助|共同)?犯|係違反|係(?=刑法第)|應論被告|各犯|均犯)")
+CONCLUSION_CHARGE_RE = re.compile(r"(?:分別係犯|分別犯|[係是](?:幫助|共同)?犯|係違反|係(?=刑法第)|應論被告|各犯(?!行(?:時|為|[，。；、]|$))|均犯)")
 PROSECUTION_CLAIM_RE = re.compile(r"公訴意旨|起訴(?:書)?意旨|聲請(?:簡易判決處刑)?意旨|聲請簡易判決處刑書(?:雖)?認|檢察官(?:認為|認|主張)")
 COURT_RESUMPTION_RE = re.compile(r"(?:惟|然|但)[，,]?(?:本院|核被告|核其所為)|本院(?:認為|認|查)")
 REJECTED_CONVICTION_RE = re.compile(r"不另為無罪|不構成|不成立|尚難認|無罪")
+VERSION_COMPARISON_CLAUSE_RE = re.compile(
+    r'(?:於)?(?:修正|修法)[前後](?:被告)?(?:所犯為|係犯|係適用)[^，。；]*'
+)
+SENTENCING_CITATION_TAIL_RE = re.compile(
+    r'^(?:前段|後段)?(?:之|的)?規定[，,]?'
+    r'(?:就被告犯行)?(?:應予|予以|酌量|酌予)?'
+    r'(?:加重|減輕(?:或免除)?|酌減|免除)(?:其刑|被告(?:之|的)刑度|其刑度)'
+)
 LAW_POINT_RE = re.compile(
     r"(?=(?:[㈠㈡㈢㈣㈤㈥㈦㈧㈨㈩]|[（(][一二三四五六七八九十]+[）)]|"
     r"[一二三四五六七八九十]+、))"
@@ -304,7 +312,7 @@ def extract_laws(reason: str, applicable_laws: str, facts: str = "") -> list[str
     found = []
     for text, conclusions_only in ((reason, True), (facts, True), (applicable_laws, False)):
         passages = [
-            sentence for sentence in re.split(r"[。；]", text)
+            sentence for sentence in re.split(r"[。；]", conviction_context(text))
             if not conclusions_only or CONCLUSION_CHARGE_RE.search(sentence)
             or ("違反" in sentence and "罪" in sentence)
         ]
@@ -361,10 +369,21 @@ def extract_verdict_descriptions(verdict: str, defendants: str = "") -> list[str
     return unique(descriptions)
 
 
+def conviction_context(text: str) -> str:
+    """只遮蔽局部比較試算與明示量刑引用，不刪整句或依條號猜測。"""
+    # 比較中的「修正後係犯」不是採用結論；後續論罪仍須原有逐罪配對。
+    text = VERSION_COMPARISON_CLAUSE_RE.sub('【新舊法比較】', text)
+    for match in reversed(list(LAW_RE.finditer(text))):
+        if SENTENCING_CITATION_TAIL_RE.match(text[match.end():]):
+            # 保留敘述邊界，避免刪掉量刑引用後把前罪法條接到下一罪。
+            text = text[:match.start(1)] + '【量刑引用】' + text[match.end():]
+    return text
+
+
 # 輔助文字從已命中的法條結尾定位罪名，避免罪名內的「之」造成截斷。
 def conviction_passages(text: str, conclusions_only=True):
     """保留法院論罪子句；檢方主張後須明示回到法院判斷才重新接受。"""
-    for sentence in re.split(r"[。；]", text):
+    for sentence in re.split(r"[。；]", conviction_context(text)):
         pending = sentence
         while pending:
             claim = PROSECUTION_CLAIM_RE.search(pending)
@@ -397,7 +416,7 @@ def extract_charges(verdict: str, reason: str, facts: str = "", defendants: str 
 # 從單一文字片段取出實體法條，排除程序法與施行法。
 def laws_in_text(text: str) -> list[str]:
     """保留片段內明載法條的出現順序。"""
-    return specific_substantive_laws([clean_law(match) for match in LAW_RE.finditer(text)])
+    return specific_substantive_laws([clean_law(match) for match in LAW_RE.finditer(conviction_context(text))])
 
 
 def charge_name_key(charge: str) -> str:
