@@ -305,6 +305,119 @@ class TestDrivingEvidence(unittest.TestCase):
         self.assertEqual(normalize_charges('[不能安全駕駛動力交通工具罪]',
             '係犯刑法第185條之3第1項第3款之不能安全駕駛動力交通工具罪。'), '[毒駕罪]')
 
+    def test_multi_charge_context_keeps_existing_all_or_nothing_policy(self):
+        charges = '[不能安全駕駛動力交通工具罪,竊盜罪]'
+        self.assertEqual(normalize_charges(charges), '')
+        self.assertEqual(normalize_charges(charges,
+            '核被告所為，係犯刑法第185條之3第1項第1款之不能安全駕駛動力交通工具罪。'),
+            '[酒駕罪,竊盜罪]')
+        self.assertEqual(normalize_charges('[不能安全駕駛罪,未分類罪]',
+            facts='被告飲酒後駕車。'), '')
+
+    def test_real_ambiguous_driving_conclusions_reach_both_interfaces(self):
+        # 原句：41252（109交簡553）、83390（113交簡211），未改罪名或款別。
+        for reason, expected in [
+            ('㈠核被告所為，係犯刑法第185條之3第1項第1款之不能安全駕駛動力交通工具罪', '酒駕罪'),
+            ('(二)核被告所為，係犯刑法第185條之3第1項第4款之不能安全駕駛動力交通工具罪', '毒駕罪'),
+        ]:
+            self.assert_class(expected, reason=reason)
+            self.assertEqual(normalize_charges('[不能安全駕駛動力交通工具罪]', reason=reason),
+                             f'[{expected}]')
+
+    def test_explicit_names_do_not_read_unrelated_context(self):
+        for charge, label in [('酒駕罪', '酒駕罪'), ('毒駕罪', '毒駕罪'),
+                              ('酒後不能安全駕駛致人於死罪', '酒駕罪'),
+                              ('施用毒品不能安全駕駛致重傷罪', '毒駕罪')]:
+            self.assertEqual(normalize_charges(f'[{charge},竊盜罪]',
+                '檢察官主張被告施用毒品後駕車。', '被告飲酒後駕車。'), f'[{label},竊盜罪]')
+
+    def test_prosecution_and_rejected_conduct_are_not_factual_evidence(self):
+        for text in ['檢察官主張被告施用安非他命後駕車。',
+                     '聲請簡易判決處刑意旨認被告飲酒後駕車。',
+                     '被告施用安非他命後駕車，尚難認定。',
+                     '被告飲酒後駕車之犯罪不成立。']:
+            with self.subTest(text=text):
+                self.assert_class('', reason=text)
+                self.assertEqual(normalize_charges('[不能安全駕駛罪]', facts=text), '')
+
+    def test_prosecution_mixed_conduct_is_not_court_mixed_finding(self):
+        self.assert_class('', '二、論罪科刑：檢察官主張被告飲用啤酒及施用安非他命後駕車。')
+
+    def test_context_attachment_is_not_court_evidence(self):
+        text = ('附件：臺灣臺北地方檢察署檢察官起訴書110年度被告甲'
+                '係犯刑法第185條之3第1項第3款之不能安全駕駛罪。')
+        self.assertEqual(normalize_charges('[不能安全駕駛罪]', reason=text), '')
+
+    def test_same_case_separate_drug_conviction_does_not_change_driving(self):
+        self.assert_class('酒駕罪',
+            '核被告所為，係犯刑法第185條之3第1項第1款之不能安全駕駛動力交通工具罪。'
+            '另係犯毒品危害防制條例第10條第2項之施用第二級毒品罪。',
+            '被告施用安非他命。')
+
+    def test_mixed_group_cannot_override_contradictory_pair(self):
+        self.assert_class('',
+            '係犯刑法第185條之3第1項第1款之服用毒品致不能安全駕駛罪。'
+            '係犯刑法第185條之3第1項第1款、第3款之不能安全駕駛罪。')
+
+    def test_driving_result_must_match_context_offense(self):
+        self.assert_class('', '係犯刑法第185條之3第1項第1款之不能安全駕駛罪。',
+                          charge='不能安全駕駛致人於死罪')
+        self.assert_class('酒駕罪', '係犯刑法第185條之3第2項之酒後不能安全駕駛致死罪。',
+                          charge='不能安全駕駛致人於死罪')
+        self.assert_class('毒駕罪', '係犯刑法第185條之3第2項之施用毒品不能安全駕駛致重傷罪。',
+                          charge='不能安全駕駛致重傷罪')
+        self.assert_class('', '係犯刑法第185條之3第2項之施用毒品不能安全駕駛致重傷罪。',
+                          charge='不能安全駕駛致死罪')
+        self.assert_class('酒駕罪', '係犯刑法第185條之3第3項之不能安全駕駛動力交通工具致人於死罪。',
+                          facts='被告飲酒後駕車肇事。', charge='不能安全駕駛動力交通工具致人於死罪')
+
+    def test_multiple_driving_offenses_need_pairing_not_shared_facts(self):
+        self.assertEqual(normalize_charges('[酒駕罪,不能安全駕駛罪]',
+            facts='被告飲酒後駕車。'), '')
+        self.assertEqual(normalize_charges('[酒駕罪,不能安全駕駛罪]',
+            reason='係犯刑法第185條之3第1項第3款之不能安全駕駛罪。'), '[酒駕罪,毒駕罪]')
+
+    def test_real_driving_obstruction_does_not_borrow_alcohol_label(self):
+        # 84235（113審交簡118）主文兩罪，姓名以甲某代替；節錄論罪配對。
+        from refresh_modeldata import apply_review
+        values, _ = build_row({
+            '被告／相對人': '甲某',
+            '主文': '甲某吐氣所含酒精濃度達每公升零點二五毫克以上而駕駛動力交通工具，'
+                    '處有期徒刑伍月。又犯駕駛動力交通工具妨害公務執行罪，處有期徒刑陸月。',
+            '理由': '係犯刑法第185條之3第1項第1款之吐氣所含酒精濃度達0.25毫克以上'
+                    '而駕駛動力交通工具罪。',
+            '事實': '被告飲酒後騎車為警查獲。',
+        })
+        row = dict(zip(HEADERS, values))
+        self.assertEqual(json.loads(row['罪名（對應標準化）']), [['酒駕罪'], []])
+        exported = apply_review({'fact': '固定事實', 'meta': {}}, row, 'reextracted', 'id')
+        self.assertEqual(exported['meta']['accusation'], [])
+        self.assertEqual(exported['meta']['reextraction']['partial_accusation'], ['酒駕罪'])
+        self.assertFalse(exported['meta']['reextraction']['task_validity']['accusation'])
+
+    def test_workbook_separates_attachment_field_before_merging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, output = Path(directory) / 'input.xlsx', Path(directory) / 'output.xlsx'
+            book = Workbook()
+            raw = book.active
+            raw.title = '裁判書資料'
+            raw.append(['裁判字號', '裁判書連結', '事實及理由', '理由'])
+            raw.append(['甲案', 'url-a',
+                '附件：臺灣臺北地方檢察署檢察官起訴書110年度被告甲'
+                '係犯刑法第185條之3第1項第3款之不能安全駕駛罪。',
+                '核被告所為，係犯刑法第185條之3第1項第1款之不能安全駕駛罪。'])
+            sheet = book.create_sheet('罪法刑結構化')
+            sheet.append(['裁判字號', '裁判書連結', '法條', '罪名', '所有宣告刑', '應執行刑'])
+            sheet.append(['甲案', 'url-a', '', '[不能安全駕駛罪,竊盜罪]', '[]', '[]'])
+            book.save(source)
+            book.close()
+            normalize_workbook(source, output)
+            result = load_workbook(output)
+            try:
+                self.assertEqual(result['標準化']['F2'].value, '[酒駕罪,竊盜罪]')
+            finally:
+                result.close()
+
     def test_workbook_uses_only_uniquely_matched_source_row(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'input.xlsx'

@@ -453,7 +453,7 @@ def charge_matches_law(charge: str, candidate: str, law: str) -> bool:
 
 
 def contextual_charge_labels(charge, reason, facts, normalizer, allow_context_mixed=True):
-    """同一駕駛罪可有酒／毒雙標籤；跨句衝突不自動合併。"""
+    """先用罪名；僅不明駕駛罪讀取法院上下文，多駕駛罪須精確配對。"""
     standard = normalizer(charge)
     if not is_driving_charge(charge):
         return [standard] if standard else []
@@ -463,27 +463,54 @@ def contextual_charge_labels(charge, reason, facts, normalizer, allow_context_mi
             return []
         # 主文明載兩種行為或兩款時保留兩種，不複製原始罪刑紀錄。
         return [kind for kind in ('酒駕罪', '毒駕罪') if kind in explicit]
+    # 所有入口共用來源與主張篩選；明確罪名不必解析上下文。
+    contexts = []
+    for text in (reason, facts):
+        court = split_prosecution_attachment(compact(text))[0]
+        court = strip_law_quotations(resolve_law_references(court, LAW_REFERENCE_DICTIONARY))
+        contexts.append('。'.join(conviction_passages(court, conclusions_only=False)))
+    reason, facts = contexts
     kinds = set()
     same_offense_mixed = False
+    conflicting_pair = False
+    unrelated_passages = set()
+    def outcome(name):
+        return bool(re.search(r'致(?:人)?(?:於)?死|重傷', name))
+
     for text in (reason, facts):
-        text = strip_law_quotations(text)
         for passage in conviction_passages(text):
             if '否認' in passage:
                 continue
             for laws, candidate in law_charge_groups(passage, charge_hint=charge):
                 if not is_driving_charge(candidate):
                     continue
+                if (outcome(charge) != outcome(candidate)
+                        or ('重傷' in charge) != ('重傷' in candidate)):
+                    unrelated_passages.add(passage)
+                    continue
+                if not allow_context_mixed and charge_matching_key(charge) != charge_matching_key(candidate):
+                    unrelated_passages.add(passage)
+                    continue
                 name_kinds = driving_charge_kinds(candidate)
                 law_kinds = set().union(*(driving_charge_kinds(law + '之不能安全駕駛罪') for law in laws))
+                conflicting_pair |= bool(name_kinds and law_kinds and not name_kinds & law_kinds)
                 kinds.update(name_kinds | law_kinds)
                 # 兩個不同句子分別提到酒與毒，不視為同一罪雙重認定。
                 same_offense_mixed |= explicitly_mixed_driving(candidate) or len(law_kinds) == 2
+    # 配對已判為另一罪的句子，不能再從事實分支繞回採用。
+    for passage in unrelated_passages:
+        reason, facts = reason.replace(passage, ''), facts.replace(passage, '')
     if allow_context_mixed and mixed_driving_in_conviction(reason):
         kinds.update(('酒駕罪', '毒駕罪'))
         same_offense_mixed = True
+    if conflicting_pair:
+        return []
     if kinds:
         if len(kinds) == 1 or (same_offense_mixed and allow_context_mixed):
             return [kind for kind in ('酒駕罪', '毒駕罪') if kind in kinds]
+        return []
+    # 同案多個駕駛罪，未配對的行為敘述不足以定位該罪。
+    if not allow_context_mixed:
         return []
     kinds = driving_fact_kinds(facts) | driving_fact_kinds(reason)
     # 單純事實層級同時出現酒毒仍不足以宣告雙標籤，須有主文／論罪認定。

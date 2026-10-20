@@ -336,17 +336,15 @@ def normalize_charge(charge: object) -> str:
 
 # 舊版整格介面保留全有全無語意，對齊新欄位改用 normalize_charge。
 def normalize_charges(value: object, reason: str = "", facts: str = "") -> str:
-    from structure_tasks import contextual_charge_labels, resolve_law_references, LAW_REFERENCE_DICTIONARY
+    from structure_tasks import contextual_charge_labels
 
     normalized: list[str] = []
-    for charge in split_labels(value):
-        standard = normalize_charge(charge)
-        standards = [standard] if standard else []
-        if is_driving_charge(charge):
-            standards = contextual_charge_labels(
-                charge, resolve_law_references(reason, LAW_REFERENCE_DICTIONARY),
-                resolve_law_references(facts, LAW_REFERENCE_DICTIONARY), normalize_charge,
-            )
+    charges = split_labels(value)
+    driving_count = sum(is_driving_charge(charge) for charge in charges)
+    for charge in charges:
+        standards = contextual_charge_labels(
+            charge, reason, facts, normalize_charge, allow_context_mixed=driving_count == 1,
+        )
         if not standards:
             return ""
         for standard in standards:
@@ -357,6 +355,8 @@ def normalize_charges(value: object, reason: str = "", facts: str = "") -> str:
 
 # 讀取結構化工作表並新增標準化工作表；刑期維持原樣以免改變量刑語意。
 def normalize_workbook(source: Path, output: Path) -> int:
+    from structure_tasks import separate_source_fields
+
     if not source.exists():
         raise FileNotFoundError(f"找不到輸入檔：{source}")
     workbook = load_workbook(source)
@@ -390,8 +390,8 @@ def normalize_workbook(source: Path, output: Path) -> int:
         row = dict(zip(headers, values))
         standard_laws, coarse_laws = normalize_law_levels(row.get("法條"))
         raw = source_rows.get((row.get("裁判字號"), row.get("裁判書連結"))) or {}
-        reason = str(raw.get("事實及理由") or "") + str(raw.get("理由") or "")
-        facts = str(raw.get("事實") or "") + str(raw.get("犯罪事實") or "")
+        reason, _ = separate_source_fields((key, raw.get(key)) for key in ("事實及理由", "理由"))
+        facts, _ = separate_source_fields((key, raw.get(key)) for key in ("事實", "犯罪事實"))
         target.append([
             row.get("裁判字號", ""), row.get("法條", ""), standard_laws, coarse_laws,
             row.get("罪名", ""), normalize_charges(row.get("罪名"), reason, facts),
@@ -409,6 +409,7 @@ def normalize_workbook(source: Path, output: Path) -> int:
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     workbook.save(output)
+    workbook.close()
     return target.max_row - 1
 
 
