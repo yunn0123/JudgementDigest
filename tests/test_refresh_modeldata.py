@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from build_structured_review import HEADERS, build_row
 from refresh_modeldata import SOURCE_COLUMNS, apply_review, match_source, read_records, refresh, refreshed_sentence, training_law_key
 
@@ -202,19 +203,35 @@ class TestRefresh(unittest.TestCase):
                 db.execute('INSERT INTO judgments VALUES ('+','.join('?' for _ in range(len(SOURCE_COLUMNS)+2))+')',
                            [1,'2023-01-01',*(source.get(key,'') for key in SOURCE_COLUMNS)])
             old=base_record();old['meta'].update(source_url=source['source_url'],year=2023)
-            input_path.write_text(json.dumps(old,ensure_ascii=False)+'\n')
+            input_path.write_text(json.dumps(old,ensure_ascii=False)+'\n',encoding='utf-8')
             db_hash=hashlib.sha256(database.read_bytes()).hexdigest()
-            with redirect_stdout(io.StringIO()):
+            connection=sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True)
+            with patch('refresh_modeldata.sqlite3.connect',return_value=connection), redirect_stdout(io.StringIO()):
                 report=refresh(input_path,database,output)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute('SELECT 1')
             exported=list(read_records(next(output.glob('*.zip'))))[0]
             self.assertEqual(exported['fact'],old['fact'])
             self.assertEqual(exported['meta']['relevant_articles'],[])
             self.assertEqual(exported['meta']['reextraction']['partial_relevant_articles'],['刑法第320條'])
             self.assertEqual(report['counts']['article_valid'],0)
-            excluded=json.loads((output/'task_exclusions.jsonl').read_text())
+            excluded=json.loads((output/'task_exclusions.jsonl').read_text(encoding='utf-8'))
+            self.assertEqual(json.loads((output/'refresh_report.json').read_text(encoding='utf-8')),report)
             self.assertIn('partial_offense_laws_missing',excluded['audit']['task_exclusion_reasons']['article'])
             self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(),db_hash)
             with self.assertRaises(FileExistsError):refresh(input_path,database,output)
+
+    def test_refresh_closes_source_when_input_is_invalid(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);input_path=root/'input.jsonl'
+            input_path.write_text('{',encoding='utf-8')
+            connection=sqlite3.connect(':memory:')
+            connection.execute('CREATE TABLE judgments (id INTEGER,case_number TEXT,judgment_date TEXT,source_url TEXT)')
+            with patch('refresh_modeldata.sqlite3.connect',return_value=connection):
+                with self.assertRaises(json.JSONDecodeError):
+                    refresh(input_path,root/'source.db',root/'out')
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute('SELECT 1')
 
 
 if __name__=='__main__':unittest.main()

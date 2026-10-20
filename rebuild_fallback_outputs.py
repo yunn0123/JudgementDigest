@@ -4,6 +4,7 @@ Raw judgments are opened read-only. Existing output directories are never replac
 """
 import argparse
 from collections import Counter
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -37,10 +38,10 @@ def rebuild(raw_db, output_dir):
                    standard_gap='罪法_有值但標準化無值', raw_gap='罪法_原始無值',
                    month_gap='刑期_有值但月數無值', sentence_gap='刑期_原始無值')
     started = time.monotonic()
-    with sqlite3.connect(raw_db.resolve().as_uri()+'?mode=ro', uri=True) as raw, \
-            sqlite3.connect(output_dir/'2018-2025_罪法刑.db') as structured, \
-            (output_dir/'comparison.jsonl').open('w') as comparisons, \
-            (output_dir/'recovered_evidence.jsonl').open('w') as evidence:
+    with closing(sqlite3.connect(raw_db.resolve().as_uri()+'?mode=ro', uri=True)) as raw, \
+            closing(sqlite3.connect(output_dir/'2018-2025_罪法刑.db')) as structured, structured, \
+            (output_dir/'comparison.jsonl').open('w', encoding='utf-8') as comparisons, \
+            (output_dir/'recovered_evidence.jsonl').open('w', encoding='utf-8') as evidence:
         raw.row_factory = sqlite3.Row
         structured.execute('CREATE TABLE "罪法刑" (id INTEGER PRIMARY KEY, '+
                            ','.join(quote(h)+' TEXT' for h in HEADERS)+')')
@@ -108,7 +109,7 @@ def rebuild(raw_db, output_dir):
                   code_sha256=hashes, seconds=round(time.monotonic()-started, 2),
                   raw_database_mode='read_only', structured_id='judgments.id',
                   fallback_enabled=True, normalization_changed=False)
-    (output_dir/'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n')
+    (output_dir/'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     return report
 

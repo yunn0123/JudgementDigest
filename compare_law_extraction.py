@@ -28,10 +28,10 @@ def load_extractor(revision=None, snapshot=None):
             sys.modules[name] = module
             if revision:
                 code = subprocess.check_output(
-                    ['git', 'show', f'{revision}:{name}.py'], cwd=ROOT, text=True)
+                    ['git', 'show', f'{revision}:{name}.py'], cwd=ROOT, text=True, encoding='utf-8')
             else:
                 path = snapshot / (name + '.py')
-                code = (path if path.exists() else ROOT / (name + '.py')).read_text()
+                code = (path if path.exists() else ROOT / (name + '.py')).read_text(encoding='utf-8')
             exec(compile(code, module.__file__, 'exec'), module.__dict__)
         module = sys.modules['build_structured_review']
         return module.build_row, module.HEADERS
@@ -58,7 +58,7 @@ def compare(raw_db, output_dir, snapshot=None):
     connection = sqlite3.connect(raw_db.resolve().as_uri() + '?mode=ro', uri=True)
     connection.row_factory = sqlite3.Row
     try:
-        with (output_dir / 'comparison.jsonl').open('w') as output:
+        with (output_dir / 'comparison.jsonl').open('w', encoding='utf-8') as output:
             query = ('SELECT id,' + ','.join(SOURCE_COLUMNS) + " FROM judgments WHERE "
                      "case_number LIKE '%刑事判決' AND judgment_date BETWEEN '2018-01-01' "
                      "AND '2025-12-31' ORDER BY id")
@@ -122,7 +122,7 @@ def compare(raw_db, output_dir, snapshot=None):
         code_sha256=code_hashes,
         snapshot=str(snapshot) if snapshot else None,
         seconds=round(time.monotonic() - started, 2))
-    (output_dir / 'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    (output_dir / 'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(report, ensure_ascii=False), flush=True)
     return report
 

@@ -136,7 +136,7 @@ def main():
     if args.min_cases < 1:
         parser.error("--min-cases 必須大於零")
     report = analyze_database(args.database, args.top, args.min_cases)
-    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({k: report[k] for k in ("frequency_statistics", "covered_cases", "frequency_bands", "boundary_ties")}, ensure_ascii=False, indent=2))
 
 

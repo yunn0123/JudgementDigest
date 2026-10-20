@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
+from contextlib import closing
 from copy import deepcopy
 import csv
 import hashlib
@@ -210,7 +211,7 @@ def refresh(input_path,raw_db,output_dir,limit=None,version='v1.2'):
     stem=f'CAIL格式_刑事判決_2018-2025_{version}_新萃取'
     output=output_dir/(stem+'.jsonl');partial=output.with_suffix('.partial.jsonl')
     original_facts=hashlib.sha256();new_facts=hashlib.sha256()
-    with sqlite3.connect(Path(raw_db).resolve().as_uri()+'?mode=ro',uri=True) as connection:
+    with closing(sqlite3.connect(Path(raw_db).resolve().as_uri()+'?mode=ro',uri=True)) as connection:
         connection.row_factory=sqlite3.Row
         indexes=index_sources(connection)
         with partial.open('w',encoding='utf-8') as data, (output_dir/'changes.csv').open('w',encoding='utf-8-sig',newline='') as cf, (output_dir/'task_exclusions.jsonl').open('w',encoding='utf-8') as problems:
@@ -281,7 +282,7 @@ def refresh(input_path,raw_db,output_dir,limit=None,version='v1.2'):
                 by_year={k:dict(v) for k,v in sorted(by_year.items())},
                 old_class_counts={k:len(v) for k,v in before_labels.items()},new_valid_class_counts={k:len(v) for k,v in after_labels.items()},
                 output_sha256=hashlib.sha256(output.read_bytes()).hexdigest())
-    (output_dir/'refresh_report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+    (output_dir/'refresh_report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     with zipfile.ZipFile(output_dir/(stem+'.zip'),'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
         for file in [output,output_dir/'refresh_report.json',output_dir/'label_frequencies.csv']:
             z.write(file,file.name)

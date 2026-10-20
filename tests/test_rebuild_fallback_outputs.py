@@ -1,5 +1,5 @@
 """Exercise the real default extractor through versioned SQLite/XLSX export."""
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import hashlib
 import io
 import json
@@ -18,7 +18,7 @@ class TestRebuildFallbackOutputs(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             database = root/'raw.db'
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 db.execute('CREATE TABLE judgments (id INTEGER PRIMARY KEY, judgment_date TEXT, '+
                            ','.join(k+' TEXT' for k in SOURCE_COLUMNS)+')')
                 values = dict.fromkeys(SOURCE_COLUMNS, '')
@@ -33,7 +33,7 @@ class TestRebuildFallbackOutputs(unittest.TestCase):
             self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), original)
             self.assertEqual(report['counts']['before_raw_empty'], 1)
             self.assertEqual(report['counts']['after_raw_empty'], 0)
-            with sqlite3.connect(root/'result'/'2018-2025_罪法刑.db') as db:
+            with closing(sqlite3.connect(root/'result'/'2018-2025_罪法刑.db')) as db:
                 raw, source, audit = db.execute(
                     'SELECT "法條（對應原始）", "法條來源", "法條備援紀錄" FROM "有罪_單被告"').fetchone()
                 self.assertEqual(json.loads(raw), [['刑法第320條第1項']])
