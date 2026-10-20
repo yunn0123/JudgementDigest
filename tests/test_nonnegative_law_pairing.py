@@ -6,9 +6,9 @@ from build_structured_review import HEADERS, build_row
 from structure_tasks import resolve_law_references
 
 
-def extract(verdict, reason='', applicable=''):
+def extract(verdict, reason='', applicable='', *, use_fallback=True):
     values, _ = build_row({'被告／相對人': '甲某', '主文': verdict,
-                           '理由': reason, '適用法條': applicable})
+                           '理由': reason, '適用法條': applicable}, use_fallback=use_fallback)
     return dict(zip(HEADERS, values))
 
 
@@ -119,7 +119,8 @@ class TestNonnegativeLawPairing(unittest.TestCase):
         self.assertEqual(laws(row), [['刑法第276條第2項'], []])
         missing = extract('甲某犯詐欺取財罪，處拘役拾日；又犯竊盜罪，處拘役拾日。',
                           '引用聲請簡易判決處刑書。依刑事訴訟法第449條，刑法第339條、第320條，判決如主文。',
-                          '刑法第339條意圖為自己不法所有，以詐術使人交付財物者。附件：原因：[]')
+                          '刑法第339條意圖為自己不法所有，以詐術使人交付財物者。附件：原因：[]',
+                          use_fallback=False)
         self.assertEqual(laws(missing), [[], []])
 
     def test_negative_and_prosecution_filters_are_unchanged(self):

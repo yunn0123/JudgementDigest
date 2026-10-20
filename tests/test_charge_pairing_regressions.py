@@ -10,9 +10,9 @@ from normalize import normalize_charge, normalize_charges, normalize_workbook
 from structure_tasks import matched_laws, resolve_law_references
 
 
-def review(charge, reason='', facts=''):
+def review(charge, reason='', facts='', *, use_fallback=True):
     row, _ = build_row({'被告／相對人': '甲某', '主文': f'甲某犯{charge}，處有期徒刑參月。',
-                        '理由': reason, '事實': facts})
+                        '理由': reason, '事實': facts}, use_fallback=use_fallback)
     return dict(zip(HEADERS, row))
 
 
@@ -93,7 +93,8 @@ class TestChargeFirstPairing(unittest.TestCase):
     def test_suspect_suffix_requires_exact_main_charge_not_coarse_guess(self):
         reason = '二、核被告甲某所為，係犯刑法第354條之毀損罪嫌。'
         self.assertEqual(json.loads(review('毀損罪', reason)['法條（對應原始）']), [['刑法第354條']])
-        self.assertEqual(json.loads(review('毀損他人物品罪', reason)['法條（對應原始）']), [[]])
+        # 精確配對的邊界不變；正式備援的較弱來源另由 integration tests 記錄。
+        self.assertEqual(json.loads(review('毀損他人物品罪', reason, use_fallback=False)['法條（對應原始）']), [[]])
 
     def test_prior_history_in_preface_does_not_delete_current_court_finding(self):
         # 60619（107訴636）：前案是本案持有期間的起點，非前案定罪引用。

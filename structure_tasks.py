@@ -562,16 +562,19 @@ def law_matching_sources(reason, facts, applicable_laws, extra_attachments=()):
 # 先取得主文罪名，再從論罪段落取得該罪的法條；不使用案件層級法條補值。
 def matched_laws(charge: str, standardized: str, main_clause: str,
                  reason: str, facts: str, applicable_laws: str,
-                 normalizer=None, extra_attachments=()) -> tuple[list[str], str]:
+                 normalizer=None, extra_attachments=(), diagnostics=None) -> tuple[list[str], str]:
     """名稱精確配對優先；同一粗類有多個不同罪名時，不猜測其對應。"""
     direct = laws_in_text(resolve_law_references(main_clause, LAW_REFERENCE_DICTIONARY))
     if direct:
         return direct, "主文同子句"
     candidates = []
+    if diagnostics is not None:
+        diagnostics['candidates'] = candidates
+        diagnostics['incomplete_parallel_laws'] = []
     adopted_matches = []
     for source_name, text, conclusions_only, allowed in law_matching_sources(reason, facts, applicable_laws, extra_attachments):
         for passage in conviction_passages(text, conclusions_only):
-            pairs = law_charge_pairs(passage, charge_hint=charge)
+            pairs = law_charge_pairs(passage, charge_hint=charge, diagnostics=diagnostics)
             exact = [(law, name) for law, name in pairs
                      if charge_matches_law(charge, name, law)
                      and (allowed is None or not allowed or law_citation_key(law) in allowed)]
@@ -615,8 +618,8 @@ def matched_laws(charge: str, standardized: str, main_clause: str,
 
 
 # 從已定位法條後取出罪名，供正式罪名與粗分類交叉比對。
-def law_charge_pairs(text: str, charge_hint: str = "") -> list[tuple[str, str]]:
-    return [(law, charge) for laws, charge in law_charge_groups(text, charge_hint) for law in laws]
+def law_charge_pairs(text: str, charge_hint: str = "", diagnostics=None) -> list[tuple[str, str]]:
+    return [(law, charge) for laws, charge in law_charge_groups(text, charge_hint, diagnostics) for law in laws]
 
 
 def charge_hint_pattern(charge: str) -> str:
@@ -649,7 +652,7 @@ def parallel_drug_use_pairs(segment: str, laws):
     return [([assigned[grade]], f'施用第{"一二"[grade-1]}級毒品罪') for grade in grades]
 
 
-def law_charge_groups(text: str, charge_hint: str = ""):
+def law_charge_groups(text: str, charge_hint: str = "", diagnostics=None):
     """把罪名前連續法條歸給該罪，並在下一個罪名後重新開始配對。"""
     pairs = []
     pending_laws = []
@@ -672,6 +675,8 @@ def law_charge_groups(text: str, charge_hint: str = ""):
         segment = re.sub(r"^(?:前段|後段)", "", segment)
         parallel = parallel_drug_use_pairs(segment, pending_laws)
         if parallel is not None:
+            if not parallel and diagnostics is not None:
+                diagnostics['incomplete_parallel_laws'].extend(pending_laws)
             # 展開只服務已知主文罪名，不憑理由新增附表未核實的罪名。
             if charge_hint:
                 pairs.extend(parallel)
@@ -740,7 +745,8 @@ def extract_offense_clauses(verdict: str, defendants: str = "") -> list[dict[str
 
 # 讓舊工作表與精簡審核表共用罪刑對齊、承前法名及同罪名法條配對規則。
 def extract_aligned_case(verdict: str, reason: str, facts: str, applicable_laws: str,
-                         defendants: str, declared: list[str], normalizer, extra_attachments=()):
+                         defendants: str, declared: list[str], normalizer, extra_attachments=(),
+                         *, use_fallback=True):
     """回傳逐罪的主文罪刑、對應法條及來源；無主文罪名時才以理由備援。"""
     # 部分來源將「事實即理由」誤併入主文；僅重定位該明示段落，不掃全案補法條。
     embedded = re.search(r'事實即理由', verdict)
@@ -776,10 +782,25 @@ def extract_aligned_case(verdict: str, reason: str, facts: str, applicable_laws:
         charge = offense["charge"]
         offense["standard_charges"] = contextual_charge_labels(charge, court_reason, court_facts, normalizer, driving_count == 1)
         offense["standard_charge"] = offense["standard_charges"][0] if len(offense["standard_charges"]) == 1 else ""
-        laws, source_name = matched_laws(
+        diagnostics = {}
+        args = (
             charge, offense["standard_charge"], offense["clause"], reason, facts,
             applicable_laws, normalizer, extra_attachments,
         )
+        laws, source_name = matched_laws(*args, diagnostics=diagnostics)
+        offense['law_fallback'] = None
+        if use_fallback and not laws:
+            if charge_source != "主文":
+                offense['law_fallback'] = dict(
+                    charge=charge, legacy_raw=[], legacy_source='', evidence=[],
+                    reasons=['no_main_verdict_offense'], recovered=False,
+                )
+            else:
+                from law_fallback import try_fallback
+                laws, audit = try_fallback(args, diagnostics)
+                offense['law_fallback'] = dict(audit, recovered=bool(laws))
+                if laws:
+                    source_name = '舊版備援（' + audit['legacy_source'] + '）'
         laws_by_offense.append(laws)
         law_sources.append(source_name)
     return offenses, laws_by_offense, charge_source, law_sources

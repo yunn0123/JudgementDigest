@@ -25,26 +25,7 @@ SOURCE_COLUMNS = {
     'criminal_facts':'犯罪事實', 'applicable_laws':'適用法條',
 }
 
-# Validate the entire citation, not a recognized law hidden inside leftover prose.
-# This uses the existing law-name parser, not normalize.LAW_WHITELIST's frequency list.
-TRAINING_LAW_RE = re.compile(
-    LAW_ARTICLE_RE.pattern + rf'(?:之[{NUM}]+)?(?:第[{NUM}]+項)?(?:第[{NUM}]+款)?'
-)
-
-
-def training_law_key(raw):
-    """Return a parseable main-article key or an audit reason; never guess a law name."""
-    if not isinstance(raw, str) or not raw.strip():
-        return None, 'empty_or_invalid_law_string'
-    text = re.sub(r'\s+', '', raw)
-    if text.startswith(LAW_REFERENCE_NAMES) or text.startswith('條例第'):
-        return None, 'unresolved_law_reference'
-    if not TRAINING_LAW_RE.fullmatch(text):
-        reason = 'law_string_residue' if extract_law_keys(text) else 'unrecognized_law_name_or_format'
-        return None, reason
-    if any(chinese_number(number) <= 0 for number in re.findall(rf'[{NUM}]+', text)):
-        return None, 'invalid_law_number'
-    return extract_law_keys(text)[0], None
+from law_label_validation import TRAINING_LAW_RE, training_law_key
 
 
 def json_labels(value):
@@ -210,6 +191,7 @@ def apply_review(record,review,status,match_method):
         'raw_laws_by_offense':raw_laws,'standard_laws_by_offense':standard_laws,
         'charge_source':review.get('罪名來源') if review else None,
         'law_source':json_labels(review.get('法條來源')) if review else [],
+        'law_fallback':json_labels(review.get('法條備援紀錄')) if review else [],
         'selected_sentence':json_labels(review.get('單一刑期')) if review else [],
         'sentence_source':review.get('單一刑期來源') if review else None,'term_reason':term_reason,
         'money_task':amount is not None,
@@ -285,7 +267,8 @@ def refresh(input_path,raw_db,output_dir,limit=None,version='v1.2'):
                 writer.writerow([task,label,a,b,b-a])
     root=Path(__file__).resolve().parent
     hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in
-            ['structure_tasks.py','driving_charge.py','normalize.py','build_structured_review.py','law_frequency.py','refresh_modeldata.py']}
+            ['structure_tasks.py','law_fallback.py','law_label_validation.py','driving_charge.py',
+             'normalize.py','build_structured_review.py','law_frequency.py','refresh_modeldata.py']}
     commit=subprocess.run(['git','rev-parse','HEAD'],cwd=root,text=True,capture_output=True).stdout.strip()
     report=dict(version=version,input_file=str(input_path),input_sha256=hashlib.sha256(Path(input_path).read_bytes()).hexdigest(),
                 raw_database=str(raw_db),raw_database_open_mode='read_only',code_commit=commit,code_sha256=hashes,

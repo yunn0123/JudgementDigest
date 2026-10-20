@@ -37,6 +37,7 @@ HEADERS = (
     "刑期資料狀態", "萃取狀態", "原始缺值欄位", "標準化缺值欄位",
     "刑期月數缺值欄位", "刑期原始缺值欄位",
     "罪名（對應標準化）",
+    "法條備援紀錄",
 )
 # Empty strings and serialized empty lists both represent missing extraction values.
 def has_value(value: object) -> bool:
@@ -77,7 +78,7 @@ def add_sheet(workbook: Workbook, name: str):
 
 
 # Convert one source row into the shared schema used by the main sheet and all review subsets.
-def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
+def build_row(source: dict, *, use_fallback=True) -> tuple[list[object], dict[str, bool]]:
     """Run extraction and normalization once, returning the row plus filter flags."""
     verdict = compact(source.get("主文"))
     reason, reason_attachments = separate_source_fields((label, source.get(label)) for label in ('事實及理由', '理由'))
@@ -90,6 +91,7 @@ def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
     offenses, raw_laws, charge_source, law_sources = extract_aligned_case(
         verdict, reason, facts, applicable_laws, defendants, declared, normalize_charge,
         reason_attachments + fact_attachments,
+        use_fallback=use_fallback,
     )
     raw_charges = [offense["charge"] for offense in offenses]
     aligned_charges = [offense["standard_charges"] for offense in offenses]
@@ -134,6 +136,7 @@ def build_row(source: dict) -> tuple[list[object], dict[str, bool]]:
         json_value(selected), json_value(sentence_months(selected)),
         sentence_source, risk, sentence_status, extraction_status,
         raw_missing, standard_missing, month_missing, sentence_missing, json_value(aligned_charges),
+        json_value([offense["law_fallback"] for offense in offenses]),
     ]
     denominator = result == "有罪" and defendant_status == "單被告"
     flags = {
