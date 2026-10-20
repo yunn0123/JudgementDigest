@@ -75,7 +75,7 @@ python -m judgment_bert.data \
   --task accusation --output data/prepared_v1.2_closed/accusation
 ```
 
-法條改用 `--task article` 與對應 output。前處理輸出 `train.jsonl`、`valid.jsonl`、`test.jsonl`、`manifest.json`；已存在的 split 不覆寫。預設按年份切分：2018–2023 訓練、2024 驗證、2025 測試（程式會將所有 ≤2023 的年份歸入訓練，來源資料需自行確認年份範圍）。沒有 10-fold；原始 `meta.fold` 不參與切分。
+法條改用 `--task article` 與對應 output。前處理輸出 `train.jsonl`、`valid.jsonl`、`test.jsonl`、`manifest.json`；已存在的 split 不覆寫。預設按年份切分：2018–2023 訓練、2024 驗證、2025 測試（程式會將所有 ≤2023 的年份歸入訓練，來源資料需自行確認年份範圍）。一般前處理不使用原始 `meta.fold`；K-fold 與 time CV 另由 `cross_validation.py` 產生。
 
 罪名／法條以訓練集頻率 ≥30 建立固定類別，所有 split 只保留這些標籤，移除標籤為空的案件；不要求另一任務標籤有效，也沒有額外事實長度門檻。同案跨集合時保留較早集合，預設亦移除與較早集合事實全文完全相同的資料。這不包含近似文字去重。
 
@@ -83,10 +83,16 @@ python -m judgment_bert.data \
 
 刑期輸出設計尚在討論，沒有新增正式訓練 config。預設維持原 Taiwan 的 11 類：≤6、>6–12、>12–18、>18–24、>24–30、>30–36、>36–60、>60–<120、≥120 月，加上無期徒刑與死刑。只保留 `term_task=true` 且刑種合格的資料，拘役與混合刑預設排除。
 
-可用 `--mtl-bins` 重現舊 MTL：先 `int(months)` 再分組，保留 ≥120 月為末組。可用 `--include-detention` 將安全萃取的單被告拘役獨立加入第 12 類；須有正的有限日數、`term_reason=detention_not_prison`、`defendant_status=單被告`。**尚未實作將拘役日數換算成月後合併分組，也尚未實作新的短刑期細分或交叉驗證。** 兩個選項供刑期前處理使用。
+可用 `--mtl-bins` 重現舊 MTL：先 `int(months)` 再分組，保留 ≥120 月為末組。可用 `--include-detention` 將安全萃取的單被告拘役獨立加入第 12 類；須有正的有限日數、`term_reason=detention_not_prison`、`defendant_status=單被告`。**尚未實作將拘役日數換算成月後合併分組，也尚未實作新的短刑期細分。** 兩個選項供刑期前處理使用。
 
 ## 輸出與版控
 
 每次訓練的獨立 output 目錄會保存 `best.pt`、tokenizer、encoder config、實際 `run_config.json`、資料 manifest 與指標。已含 `best.pt` 的目錄會拒絕覆寫。預設只以 VALID 選模，TEST 評估須明確啟用。
 
 本目錄 `.gitignore` 排除本機 `data/`、`runs/`、`reports/`、JSONL、CSV 與模型權重，避免將資料集及訓練產物加入版控。這份程式快照不會隨原 Taiwan 目錄自動同步。
+
+## 平衡 K-fold 與巢狀 time cross-validation
+
+罪名／法條共用的流程見 [CROSS_VALIDATION.md](CROSS_VALIDATION.md)。內層預設5-fold（可選10-fold），在不拆同案／重複事實群組下平衡月份、多標籤與筆數；外層逐年向前驗證，2025保留最終TEST。只用內層平均分數選設定、以最佳epoch中位數決定完整過去年份重訓輪數，外層只在重訓完成後評分一次。
+
+`judgment_bert/balancing.py` 負責群組平衡；`judgment_bert/nested_cv.py` 負責巢狀資料準備、候選選擇、固定輪數重訓與外層分數彙整。完整正式訓練尚未執行。

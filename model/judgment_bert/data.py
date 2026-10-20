@@ -76,10 +76,11 @@ def filter_to_classes(records, classes, kind='multilabel'):
 
 
 def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2025,
-            min_label_freq=30, deduplicate_facts=True, include_detention=False, mtl_bins=False):
+            min_label_freq=30, deduplicate_facts=True, include_detention=False, mtl_bins=False, split_by_line=None,
+            required_splits=('train', 'valid', 'test')):
     if task not in TASKS:
         raise ValueError(f'Unknown task: {task}')
-    if not train_through < valid_year < test_year:
+    if split_by_line is None and not train_through < valid_year < test_year:
         raise ValueError('Require train-through < valid-year < test-year')
     if min_label_freq < 1:
         raise ValueError('min_label_freq must be positive')
@@ -95,6 +96,10 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
         if not isinstance(year, int):
             skipped['missing_year'] += 1; continue
         split = 'train' if year <= train_through else 'valid' if year == valid_year else 'test' if year == test_year else None
+        if split_by_line is not None:
+            split = split_by_line.get(line)
+            if split not in (None, 'train', 'valid', 'test'):
+                raise ValueError(f'Invalid split at source line {line}: {split}')
         if split is None:
             skipped['outside_requested_years'] += 1; continue
         case = str(meta.get('case_number') or meta.get('source_url') or f'line:{line}')
@@ -161,12 +166,14 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
                 f.write(json.dumps(record, ensure_ascii=False)+'\n')
         split_info[split] = dict(n=len(records), years=dict(Counter(r['year'] for r in records)),
                                 removed_label_occurrences=dict(unknown_labels))
-    if any(not frames[k] for k in ('train','valid','test')):
+    if any(not frames[k] for k in required_splits):
         raise ValueError('A split is empty; inspect requested years and task eligibility')
     manifest = dict(include_detention=include_detention, mtl_bins=mtl_bins, label_filter_policy='train_classes_all_splits_drop_empty', task=task, classes=classes, num_labels=len(classes),
                     kind='multiclass' if task=='imprisonment' else 'multilabel',
                     source_file=Path(path).name, source_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
-                    train_through=train_through, valid_year=valid_year, test_year=test_year,
+                    split_policy='explicit_source_lines' if split_by_line is not None else 'calendar_years',
+                    train_through=None if split_by_line is not None else train_through,
+                    valid_year=None if split_by_line is not None else valid_year, test_year=test_year,
                     min_label_freq=min_label_freq, training_label_frequencies=dict(frequency),
                     exact_fact_deduplication=deduplicate_facts, cross_split_exact_fact_overlap=cross_split_overlap,
                     removed_duplicate_fact_rows=dict(removed), removed_cross_split_case_rows=dict(case_removed),

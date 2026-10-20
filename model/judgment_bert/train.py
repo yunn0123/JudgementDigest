@@ -80,9 +80,13 @@ def format_epoch(info):
 
 
 def format_training_summary(result):
-    sections=[format_epoch(info) for info in result['history']]
-    sections.append(f"[VALID] Best Macro-F1={result['best_valid_macro_f1']:.2%}")
-    sections.append(format_metrics('TEST',result['test']) if 'test' in result else
+    sections=[format_epoch(info) if 'valid' in info else
+              f"Epoch {info['epoch']}\n[TRAIN] Loss={info['train_loss']:.6f}" for info in result['history']]
+    if result['best_valid_macro_f1'] is not None:
+        sections.append(f"[VALID] Best Macro-F1={result['best_valid_macro_f1']:.2%}")
+    else:
+        sections.append('[VALID] Not used; fixed-epoch refit.')
+    sections.append(format_metrics(result.get('evaluation_role','test'),result['test']) if 'test' in result else
                     '[TEST] Not evaluated (held out; --evaluate-test disabled).')
     return '\n\n'.join(sections)+'\n'
 
@@ -132,8 +136,9 @@ def parse_args(argv=None):
     parser.add_argument('--threshold',type=float,default=.5)
     parser.add_argument('--seed',type=int,default=42)
     parser.add_argument('--device',default='auto',help='auto chooses CUDA, then Apple MPS, then CPU')
-    parser.add_argument('--evaluate-test',action='store_true')
+    parser.add_argument('--evaluate-test',action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument('--check-data',action='store_true',help='Inspect prepared data, without tokenizer/model downloads')
+    parser.add_argument('--fixed-epochs',action='store_true',help='Refit for exactly epochs; no validation selection or early stopping')
     parser.add_argument('--tiny-smoke',action='store_true',help='Random tiny BERT, 1 epoch, tiny subsets; NOT an experiment result')
     argv=list(sys.argv[1:] if argv is None else argv)
     probe=argparse.ArgumentParser(add_help=False)
@@ -189,7 +194,8 @@ def main():
     if (args.output/'best.pt').exists():
         raise ValueError('Output already contains a checkpoint; select a new output directory')
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-    records={split:read_jsonl(args.data_dir/f'{split}.jsonl') for split in ('train','valid','test')}
+    active_splits=['train'] + ([] if args.fixed_epochs else ['valid']) + (['test'] if args.evaluate_test else [])
+    records={split:read_jsonl(args.data_dir/f'{split}.jsonl') for split in active_splits}
     filtering={}
     for split in records:
         records[split],filtering[split]=filter_to_classes(records[split],manifest['classes'],manifest['kind'])
@@ -251,6 +257,12 @@ def main():
                 nn.utils.clip_grad_norm_(model.parameters(),args.max_grad_norm);optimizer.step()
                 if scheduler is not None: scheduler.step()
                 optimizer.zero_grad()
+        if args.fixed_epochs:
+            info=dict(epoch=epoch+1,train_loss=total_loss/len(loaders['train']))
+            history.append(info)
+            print(f"Epoch {epoch+1} [TRAIN] Loss={info['train_loss']:.6f} [VALID] Not used (fixed epochs)",flush=True)
+            torch.save(model.state_dict(),args.output/'best.pt')
+            continue
         validation=evaluate(model,loaders['valid'],device,records['valid'],manifest,args.threshold)
         info=dict(epoch=epoch+1,train_loss=total_loss/len(loaders['train']),valid=validation)
         history.append(info); print(format_epoch(info),flush=True)
@@ -261,13 +273,16 @@ def main():
             stale+=1
         if stale>=args.patience:
             break
-    result=dict(tiny_random_smoke=args.tiny_smoke,history=history,best_valid_macro_f1=best,
+    result=dict(tiny_random_smoke=args.tiny_smoke,history=history,best_valid_macro_f1=None if args.fixed_epochs else best,
+                fixed_epochs=args.fixed_epochs, evaluation_role=manifest.get('evaluation_role','test'),
                 metric_sources=METRIC_SOURCES, label_filtering=filtering,
                 test_status='evaluated' if args.evaluate_test else 'not_evaluated')
     if args.evaluate_test:
         model.load_state_dict(torch.load(args.output/'best.pt',map_location=device,weights_only=True))
         result['test']=evaluate(model,loaders['test'],device,records['test'],manifest,args.threshold)
-    print(format_metrics('TEST',result['test']) if 'test' in result else
+        if result['evaluation_role']=='outer_valid':
+            result['metric_sources']=dict(METRIC_SOURCES, test='OUTER_VALID: next year; evaluated once after fixed-epoch refit')
+    print(format_metrics(result.get('evaluation_role','test'),result['test']) if 'test' in result else
           '[TEST] Not evaluated (held out; --evaluate-test disabled).',flush=True)
     (args.output/'training_summary.txt').write_text(format_training_summary(result),encoding='utf-8')
     (args.output/'metrics.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
