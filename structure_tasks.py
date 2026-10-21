@@ -103,6 +103,11 @@ def compact(value) -> str:
     return re.sub(r"\s+", "", str(value or ""))
 
 
+def split_defendant_names(value) -> list[str]:
+    """分號分隔姓名紀錄；空格、間隔號及頓號均保留，不推斷身分或去重。"""
+    return [name.strip() for name in re.split(r"[；;]", str(value or "")) if name.strip()]
+
+
 # 截掉誤併入主文欄的事實與理由，避免把後文論罪或前科當成本案主文。
 def main_section(verdict: str) -> str:
     marker = re.search(r"主文[：:]", verdict)
@@ -336,19 +341,20 @@ def extract_verdict_charges(verdict: str) -> list[str]:
 
 # 主文未寫「犯」或「罪」時，以被告名後、宣告刑前的文字作為罪名描述。
 # 併科、易科與應執行不是單罪宣告刑起點；附表引用與程序性主文也不收。
+def _first_declared_sentence(clause):
+    return min((match for match in (
+        PRIMARY_RE.search(clause),
+        re.search(rf"(?<![易併])(?:處|科)罰金(?:新臺幣)?[{NUM},]+元", clause),
+    ) if match), key=lambda match: match.start(), default=None)
+
+
 def extract_verdict_descriptions(verdict: str, defendants: str = "") -> list[str]:
     descriptions = []
-    names = sorted((name for name in re.split(r"[；;]", defendants) if name), key=len, reverse=True)
-    for clause in re.split(r"[。；]", main_section(verdict)):
+    names = sorted((compact(name) for name in split_defendant_names(defendants)), key=len, reverse=True)
+    for clause in re.split(r"[。；]", main_section(compact(verdict))):
         if re.match(r"\s*應執(?:行|刑)", clause):
             continue
-        primary = PRIMARY_RE.search(clause)
-        standalone_fine = re.search(rf"(?<![易併])(?:處|科)罰金(?:新臺幣)?[{NUM},]+元", clause)
-        sentence = min(
-            (match for match in (primary, standalone_fine) if match),
-            key=lambda match: match.start(),
-            default=None,
-        )
+        sentence = _first_declared_sentence(clause)
         if not sentence:
             continue
         description = clause[:sentence.start()].rstrip("，,均各")
@@ -367,6 +373,33 @@ def extract_verdict_descriptions(verdict: str, defendants: str = "") -> list[str
                 and not any(word in description for word in ("無罪", "免訴", "不受理", "撤銷", "駁回"))):
             descriptions.append(description)
     return unique(descriptions)
+
+
+def verdict_clause_charges(clause: str, defendants: str = "") -> list[str]:
+    """只在主文子句的受判決者位置依序試實名、遮名／代號、既有規則。"""
+    text = compact(clause)
+    subject = re.sub(rf"^(?:[{NUM}]+[、．.])?主刑部分[：:]?", "", text)
+    subject = re.sub(rf"^(?:[{NUM}]+[、．.]|[（(][{NUM}]+[）)])", "", subject)
+    names = sorted((compact(name) for name in split_defendant_names(defendants)), key=len, reverse=True)
+    actual = "|".join(re.escape(name) for name in names)
+    anonymous = r"[甲乙丙丁戊己庚辛壬癸][○〇◯ＯO]{2,}|[A-ZＡ-Ｚ][0-9０-９]{2,}"
+    for pattern in (actual, anonymous):
+        if not pattern:
+            continue
+        match = re.match(rf"^(?:被告)?(?:{pattern})(?:[、，,及與](?:{pattern}))*", subject)
+        if not match:
+            continue
+        tail = subject[match.end():].lstrip("，,")
+        # 本輪不改附表引用的既有解析／准入行為。
+        sentence = _first_declared_sentence(tail)
+        if "附表" in (tail[:sentence.start()] if sentence else tail):
+            break
+        charges = extract_verdict_charges(tail)
+        if not charges:
+            charges = [re.sub(r"^(?:均|各)?(?:又|另)?(?:共同)?犯", "", charge)
+                       for charge in extract_verdict_descriptions(tail)]
+        return charges
+    return extract_verdict_charges(text) or extract_verdict_descriptions(text, defendants)
 
 
 def conviction_context(text: str) -> str:
@@ -407,8 +440,7 @@ def extract_supporting_charges(text: str) -> list[str]:
 
 # 罪名以主文為準；主文沒有可用描述時，才依序退回理由與事實欄位。
 def extract_charges(verdict: str, reason: str, facts: str = "", defendants: str = "") -> list[str]:
-    return (extract_verdict_charges(verdict)
-            or extract_verdict_descriptions(verdict, defendants)
+    return (unique(offense['charge'] for offense in extract_offense_clauses(verdict, defendants))
             or extract_supporting_charges(reason)
             or extract_supporting_charges(facts))
 
@@ -751,8 +783,8 @@ def charges_after_laws(text: str) -> list[str]:
 def extract_offense_clauses(verdict: str, defendants: str = "") -> list[dict[str, str]]:
     """將主文依出現順序拆成可對齊的罪刑紀錄。"""
     offenses = []
-    for clause in re.split(r"[。；]|，(?=(?:又|另)(?!處|科|應執行))", main_section(verdict)):
-        charges = extract_verdict_charges(clause) or extract_verdict_descriptions(clause, defendants)
+    for clause in re.split(r"[。；]|，(?=(?:又|另)(?!處|科|應執行))", main_section(compact(verdict))):
+        charges = verdict_clause_charges(clause, defendants)
         if not charges:
             continue
         primaries = [normalize_sentence(value) for value in PRIMARY_RE.findall(clause)]
@@ -884,7 +916,7 @@ def maximum_sentence_months(sentences: list[str]) -> Union[int, float, str]:
 def sentence_data_status(declared: list[str], executions: list[str], defendants: str) -> str:
     if executions:
         return "有應執行刑"
-    if declared and "；" in defendants and len(declared) > 1:
+    if declared and len(split_defendant_names(defendants)) > 1 and len(declared) > 1:
         return "多被告未配對"
     if declared:
         return "僅宣告刑"
@@ -899,7 +931,7 @@ def structure_row(row: dict) -> list[object]:
     reason, reason_attachments = separate_source_fields((label, row.get(label)) for label in ('事實及理由', '理由'))
     facts, fact_attachments = separate_source_fields((label, row.get(label)) for label in ('事實', '犯罪事實'))
     applicable_laws = compact(row.get("適用法條"))
-    defendants = compact(row.get("被告／相對人"))
+    defendants = row.get("被告／相對人") or ""
     declared, executions = extract_sentences(verdict)
     offenses, laws_by_offense, _, _ = extract_aligned_case(
         verdict, reason, facts, applicable_laws, defendants, declared, normalize_charge,

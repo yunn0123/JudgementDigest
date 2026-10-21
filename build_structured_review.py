@@ -20,6 +20,7 @@ from structure_tasks import (
     sentence_months,
     sentence_to_months,
     separate_source_fields,
+    split_defendant_names,
 )
 
 
@@ -51,14 +52,9 @@ def json_value(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-# Require defendant-like names to appear in the main text; polluted party fragments stay unknown.
 def classify_defendants(defendants: str, verdict: str) -> str:
-    """Classify a case as single, multiple, or unknown using names evidenced in the main text."""
-    names = {
-        part for part in re.split(r"[；;]", compact(defendants))
-        if re.fullmatch(r"[\u4e00-\u9fff○Ａ-ＺA-Za-z]{2,8}", part)
-        and part in compact(verdict)
-    }
+    """依分號分隔的姓名紀錄計數，不用主文比對結果或姓名格式刪人。"""
+    names = split_defendant_names(defendants)
     return "單被告" if len(names) == 1 else "多被告" if len(names) > 1 else "不明"
 
 
@@ -84,7 +80,7 @@ def build_row(source: dict, *, use_fallback=True) -> tuple[list[object], dict[st
     reason, reason_attachments = separate_source_fields((label, source.get(label)) for label in ('事實及理由', '理由'))
     facts, fact_attachments = separate_source_fields((label, source.get(label)) for label in ('事實', '犯罪事實'))
     applicable_laws = compact(source.get("適用法條"))
-    defendants = compact(source.get("被告／相對人"))
+    defendants = source.get("被告／相對人") or ""
     defendant_status = classify_defendants(defendants, verdict)
     declared, executions = extract_sentences(verdict)
     execution_fines = extract_execution_fines(verdict)
