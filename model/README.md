@@ -91,8 +91,8 @@ python -m judgment_bert.data \
 
 本目錄 `.gitignore` 排除本機 `data/`、`runs/`、`reports/`、JSONL、CSV 與模型權重，避免將資料集及訓練產物加入版控。這份程式快照不會隨原 Taiwan 目錄自動同步。
 
-## 平衡 K-fold 與巢狀 time cross-validation
+## 單一fold Grid Search與固定設定評估
 
-罪名／法條共用的流程見 [CROSS_VALIDATION.md](CROSS_VALIDATION.md)。內層預設5-fold（可選10-fold），在不拆同案／重複事實群組下平衡月份、多標籤與筆數；外層逐年向前驗證，2025保留最終TEST。只用內層平均分數選設定、以最佳epoch中位數決定完整過去年份重訓輪數，外層只在重訓完成後評分一次。
+目前主流程見 [CROSS_VALIDATION.md](CROSS_VALIDATION.md)：先以固定fold的TRAIN／VALID跑Grid Search，選好設定後，重新訓練平衡10-fold作主要平均結果，再以同一設定做Time CV額外分析。分折兼顧月份、多標籤與筆數，不拆同案／重複事實群組；2025保留最終TEST。
 
-`judgment_bert/balancing.py` 負責群組平衡；`judgment_bert/nested_cv.py` 負責巢狀資料準備、候選選擇、固定輪數重訓與外層分數彙整。完整正式訓練尚未執行。
+`grid_search.py` 提供搜尋、設定鎖定與主要／時間評估入口；`cross_validation.py` 負責資料與逐折訓練、彙整。這是非巢狀評估，調參樣本可能再進入10-fold，分數的選模偏差需揭露。先前巢狀訓練已取消，程式及結果保留供重現，見 [NESTED_CV.md](NESTED_CV.md)。
