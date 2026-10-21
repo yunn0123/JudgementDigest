@@ -83,6 +83,9 @@ def evaluate_locked(search, prepared, output, role='main'):
     if role not in ('main','time'):
         raise ValueError('Unknown evaluation role')
     search=Path(search).resolve();prepared=Path(prepared).resolve();output=Path(output).resolve()
+    hold=search/'evaluation_hold.json'
+    if hold.exists():
+        return dict(status='skipped',role=role,reason=json.loads(hold.read_text())['reason'])
     selection=json.loads((search/'search_summary.json').read_text())
     plan=json.loads((prepared/'cv_manifest.json').read_text())
     if selection.get('status')!='completed':

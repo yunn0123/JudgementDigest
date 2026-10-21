@@ -81,3 +81,14 @@ class TestGridSearch(unittest.TestCase):
                 path.write_text(json.dumps(settings))
             with patch('judgment_bert.grid_search.subprocess.run',side_effect=wrong_config):
                 with self.assertRaises(ValueError):tune(data,base,grid,p/'search')
+
+    def test_evaluation_hold_skips_before_reading_data_or_starting_models(self):
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder);search=p/'search';search.mkdir()
+            (search/'evaluation_hold.json').write_text(json.dumps(dict(reason='Tuning only')))
+            with patch('judgment_bert.grid_search.train_cv') as launch:
+                for role in ('main','time'):
+                    result=evaluate_locked(search,p/'no_data',p/role,role)
+                    self.assertEqual(result['status'],'skipped')
+                    self.assertFalse((p/role).exists())
+                launch.assert_not_called()

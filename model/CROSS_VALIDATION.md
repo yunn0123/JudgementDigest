@@ -1,3 +1,5 @@
+> 現行主入口為 `train_model.py`，Grid Search不再預設呼叫，Time CV獨立且預設關閉；操作見 [MODEL_WORKFLOW.md](MODEL_WORKFLOW.md)。以下保留單獨重現搜尋與CV的指令。
+
 # 單一 fold Grid Search → 固定設定10-fold／時間分析
 
 目前主流程不做巢狀驗證。先以一份固定TRAIN／VALID fold搜尋超參數，鎖定最佳設定後，分別重新訓練10-fold（主要結果）與Time CV（額外分析）。2025保留為獨立最終TEST，以下指令均不評估它。

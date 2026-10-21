@@ -1,6 +1,7 @@
 """Train ONE of accusation/article/imprisonment per process and output directory."""
 from __future__ import annotations
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import random
@@ -26,6 +27,21 @@ def resolve_device(name='auto'):
     if torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
+
+
+def precision_context(device, precision):
+    if precision == 'fp32':
+        return nullcontext()
+    dtype = torch.float16 if precision == 'fp16' else torch.bfloat16
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def make_grad_scaler(device, precision):
+    if precision != 'fp16':
+        return None
+    if not hasattr(torch.amp, 'GradScaler'):
+        raise ValueError('FP16 AMP requires a newer PyTorch with torch.amp.GradScaler; tested on 2.8')
+    return torch.amp.GradScaler(device.type)
 
 
 def read_jsonl(path):
@@ -91,11 +107,13 @@ def format_training_summary(result):
     return '\n\n'.join(sections)+'\n'
 
 
-def evaluate(model,loader,device,records,manifest,threshold):
+def evaluate(model,loader,device,records,manifest,threshold,precision='fp32'):
     model.eval(); logits=[]; indexes=[]
     with torch.no_grad():
         for batch,_,idx in loader:
-            logits.append(model(**{k:v.to(device) for k,v in batch.items()}).cpu().numpy())
+            with precision_context(device,precision):
+                prediction=model(**{k:v.to(device) for k,v in batch.items()})
+            logits.append(prediction.float().cpu().numpy())
             indexes.extend(idx)
     truth=[records[i]['true_labels'] for i in indexes]
     return metrics(np.concatenate(logits),truth,manifest['classes'],manifest['kind'],threshold)
@@ -135,6 +153,7 @@ def parse_args(argv=None):
     parser.add_argument('--pos-weight-cap',type=float,default=10.,help='Cap per-class negative/positive ratio; only used with pos-weight')
     parser.add_argument('--threshold',type=float,default=.5)
     parser.add_argument('--seed',type=int,default=42)
+    parser.add_argument('--precision',choices=['fp32','fp16','bf16'],default='fp32',help='Opt-in autocast; fp16 uses gradient scaling, fp32 preserves baseline')
     parser.add_argument('--device',default='auto',help='auto chooses CUDA, then Apple MPS, then CPU')
     parser.add_argument('--evaluate-test',action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument('--check-data',action='store_true',help='Inspect prepared data, without tokenizer/model downloads')
@@ -216,6 +235,7 @@ def main():
         raise ValueError('max-length exceeds the encoder position limit or leaves no content')
     device=resolve_device(args.device)
     model.to(device)
+    scaler=make_grad_scaler(device,args.precision)
     datasets={split:FactDataset(rows,tokenizer,manifest['classes'],manifest['kind'],args.max_length,
                                 args.long_text,args.overlap,args.max_chunks) for split,rows in records.items()}
     collator=Collator(tokenizer.pad_token_id,args.long_text=='chunk')
@@ -249,13 +269,25 @@ def main():
         model.train(); optimizer.zero_grad(); total_loss=0
         for step,(batch,target,_) in enumerate(loaders['train']):
             batch={k:v.to(device) for k,v in batch.items()};target=target.to(device)
-            raw_loss=criterion(model(**batch),target)
+            with precision_context(device,args.precision):
+                raw_loss=criterion(model(**batch),target)
             group_start=step-step%args.grad_accum
             divisor=min(args.grad_accum,len(loaders['train'])-group_start)
-            (raw_loss/divisor).backward();total_loss+=raw_loss.item()
+            loss=raw_loss/divisor
+            if scaler is None: loss.backward()
+            else: scaler.scale(loss).backward()
+            total_loss+=raw_loss.item()
             if (step+1)%args.grad_accum==0 or step+1==len(loaders['train']):
-                nn.utils.clip_grad_norm_(model.parameters(),args.max_grad_norm);optimizer.step()
-                if scheduler is not None: scheduler.step()
+                if scaler is not None: scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(),args.max_grad_norm)
+                stepped=True
+                if scaler is None:
+                    optimizer.step()
+                else:
+                    old_scale=scaler.get_scale()
+                    scaler.step(optimizer);scaler.update()
+                    stepped=scaler.get_scale()>=old_scale
+                if scheduler is not None and stepped: scheduler.step()
                 optimizer.zero_grad()
         if args.fixed_epochs:
             info=dict(epoch=epoch+1,train_loss=total_loss/len(loaders['train']))
@@ -263,7 +295,7 @@ def main():
             print(f"Epoch {epoch+1} [TRAIN] Loss={info['train_loss']:.6f} [VALID] Not used (fixed epochs)",flush=True)
             torch.save(model.state_dict(),args.output/'best.pt')
             continue
-        validation=evaluate(model,loaders['valid'],device,records['valid'],manifest,args.threshold)
+        validation=evaluate(model,loaders['valid'],device,records['valid'],manifest,args.threshold,args.precision)
         info=dict(epoch=epoch+1,train_loss=total_loss/len(loaders['train']),valid=validation)
         history.append(info); print(format_epoch(info),flush=True)
         if validation['macro_f1']>best+args.early_stop_min_delta:
@@ -279,7 +311,7 @@ def main():
                 test_status='evaluated' if args.evaluate_test else 'not_evaluated')
     if args.evaluate_test:
         model.load_state_dict(torch.load(args.output/'best.pt',map_location=device,weights_only=True))
-        result['test']=evaluate(model,loaders['test'],device,records['test'],manifest,args.threshold)
+        result['test']=evaluate(model,loaders['test'],device,records['test'],manifest,args.threshold,args.precision)
         if result['evaluation_role']=='outer_valid':
             result['metric_sources']=dict(METRIC_SOURCES, test='OUTER_VALID: next year; evaluated once after fixed-epoch refit')
     print(format_metrics(result.get('evaluation_role','test'),result['test']) if 'test' in result else

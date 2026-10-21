@@ -11,7 +11,8 @@ class AttentionPool(nn.Module):
         self.score = nn.Linear(hidden, 1, bias=False)
 
     def forward(self, states, mask):
-        scores = self.score(states).squeeze(-1).masked_fill(~mask.bool(), torch.finfo(states.dtype).min)
+        scores = self.score(states).squeeze(-1)
+        scores = scores.masked_fill(~mask.bool(), torch.finfo(scores.dtype).min)
         weights = scores.softmax(-1) * mask.to(states.dtype)
         weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-9)
         return (weights.unsqueeze(-1) * states).sum(1)

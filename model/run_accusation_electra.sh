@@ -3,5 +3,5 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")"
 if [[ -n "${OUTPUT:-}" ]]; then set -- --output "$OUTPUT" "$@"; fi
 if [[ -n "${DEVICE:-}" ]]; then set -- --device "$DEVICE" "$@"; fi
-exec "${PYTHON:-python}" -m judgment_bert.train \
-  --config configs/accusation_electra.json "$@"
+exec "${PYTHON:-python}" train_model.py \
+  --config configs/accusation_experiment.json "$@"

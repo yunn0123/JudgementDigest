@@ -1,6 +1,19 @@
 # Taiwan 判決預測模型
 
-由 `BERT-base-prediction/Taiwan` 整理而來的程式快照（2026-10-20）。每次執行只訓練一個任務：罪名、法條或刑期；各自使用 encoder、分類頭與 checkpoint，沒有 MTL 權重共享。本目錄包含程式與設定，不包含資料集、預訓練權重、訓練結果或個案紀錄。
+由 `BERT-base-prediction/Taiwan` 整理而來的程式快照（2026-10-21）。每次執行只訓練一個任務：罪名、法條或刑期；各自使用 encoder、分類頭與 checkpoint，沒有 MTL 權重共享。本目錄包含程式與設定，不包含資料集、預訓練權重、訓練結果或個案紀錄。
+
+## 現行主入口
+
+使用 [`train_model.py`](train_model.py)，預設5-fold、最多5 epochs、FP32、`time_cv=false`。主模型VALID全部完成後，只有開啟Time CV才呼叫獨立 [`judgment_bert/time_cv.py`](judgment_bert/time_cv.py)。Grid Search已完成，呼叫保留為註解，最佳encoder LR=2e-5、dropout=0.1已寫入預設config；不需先重新搜尋。
+
+完整操作與流程見 [MODEL_WORKFLOW.md](MODEL_WORKFLOW.md)，搜尋結果見 [GRID_SEARCH_RESULTS.md](GRID_SEARCH_RESULTS.md)，4萬／10萬／20萬筆的折數與epoch估時見 [TRAINING_ESTIMATES.md](TRAINING_ESTIMATES.md)。
+
+```bash
+python train_model.py --print-config
+# 正式訓練時替換資料與新的輸出目錄；預設不跑額外Time CV
+python train_model.py --data /本機路徑/資料.jsonl --output runs/new_data_5fold
+# 可加 --folds 10、--epochs 3、--precision bf16；需要額外時間分析才加 --time-cv
+```
 
 ## 目前架構
 
@@ -54,7 +67,7 @@ python -m pip install -r requirements.txt
 python -m judgment_bert.train --config configs/accusation_electra.json --print-config
 
 # 已在本機準備好資料後才執行訓練
-bash run_accusation_electra.sh
+bash run_accusation_electra.sh --data /本機路徑/資料.jsonl --output runs/new_data_5fold
 bash run_article_electra.sh
 
 # 測試不下載預訓練權重；使用本機建立的 tiny encoder/tokenizer
@@ -91,8 +104,6 @@ python -m judgment_bert.data \
 
 本目錄 `.gitignore` 排除本機 `data/`、`runs/`、`reports/`、JSONL、CSV 與模型權重，避免將資料集及訓練產物加入版控。這份程式快照不會隨原 Taiwan 目錄自動同步。
 
-## 單一fold Grid Search與固定設定評估
+## 既有研究入口
 
-目前主流程見 [CROSS_VALIDATION.md](CROSS_VALIDATION.md)：先以固定fold的TRAIN／VALID跑Grid Search，選好設定後，重新訓練平衡10-fold作主要平均結果，再以同一設定做Time CV額外分析。分折兼顧月份、多標籤與筆數，不拆同案／重複事實群組；2025保留最終TEST。
-
-`grid_search.py` 提供搜尋、設定鎖定與主要／時間評估入口；`cross_validation.py` 負責資料與逐折訓練、彙整。這是非巢狀評估，調參樣本可能再進入10-fold，分數的選模偏差需揭露。先前巢狀訓練已取消，程式及結果保留供重現，見 [NESTED_CV.md](NESTED_CV.md)。
+直接操作單fold搜尋、固定設定CV的舊入口仍保留，見 [CROSS_VALIDATION.md](CROSS_VALIDATION.md)。目前主程式直接使用已選設定，不再先跑搜尋。先前巢狀訓練已取消，程式及結果保留供重現，見 [NESTED_CV.md](NESTED_CV.md)。

@@ -27,5 +27,6 @@
   "seed": 42,
   "expected_min_label_freq": 30,
   "device": "auto",
-  "evaluate_test": false
+  "evaluate_test": false,
+  "precision": "fp32"
 }
