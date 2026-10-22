@@ -4,7 +4,7 @@
   "training_config": "configs/accusation_cv_electra.json",
   "task": "accusation",
   "folds": 5,
-  "epochs": 5,
+  "epochs": 3,
   "precision": "fp32",
   "time_cv": false,
   "first_year": 2018,

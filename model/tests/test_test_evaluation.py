@@ -55,6 +55,25 @@ class HeldoutEvaluationTest(unittest.TestCase):
             self.assertEqual(result['test_year'],2025)
             self.assertFalse((runs/'fold_01/metrics.json').read_text().find('not_evaluated')==-1)
 
+    def test_new_protocol_reads_reserved_year_not_outer_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);prepared,runs=self.fixture(root)
+            plan=json.loads((prepared/'cv_manifest.json').read_text());plan['mode']='kfold_test'
+            (prepared/'cv_manifest.json').write_text(json.dumps(plan))
+            for name in ('fold_01','fold_02'):
+                folder=prepared/name
+                (folder/'test.jsonl').rename(folder/'holdout.jsonl')
+                row=json.loads((folder/'holdout.jsonl').read_text());row['year']=2024
+                (folder/'test.jsonl').write_text(json.dumps(row)+'\n')
+                path=runs/name/'metrics.json';metrics=json.loads(path.read_text())
+                metrics.update(test_status='evaluated',evaluation_role='outer_test')
+                path.write_text(json.dumps(metrics))
+            with patch('judgment_bert.model.SingleTaskBert',side_effect=self.model):
+                result=run(prepared,runs,root/'test_results')
+            self.assertEqual(result['test_year'],2025)
+            self.assertEqual(result['test_n'],1)
+            self.assertEqual(result['test']['micro_f1']['mean'],1.)
+
     def test_reject_different_test_and_wrong_year(self):
         with tempfile.TemporaryDirectory() as tmp:
             prepared,runs=self.fixture(Path(tmp));path=prepared/'fold_02/test.jsonl'

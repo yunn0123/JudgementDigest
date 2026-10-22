@@ -1,3 +1,5 @@
+> 現行主入口已改為每折內部 VALID 選模、外層 TEST 評分，見 [OUTER_TEST_CV.md](OUTER_TEST_CV.md)。以下保留舊協定的紀錄／指令／估算，不代表新協定的訓練結果。
+
 > 現行主入口為 `train_model.py`，Grid Search不再預設呼叫，Time CV獨立且預設關閉；操作見 [MODEL_WORKFLOW.md](MODEL_WORKFLOW.md)。以下保留單獨重現搜尋與CV的指令。
 
 # 單一 fold Grid Search → 固定設定10-fold／時間分析

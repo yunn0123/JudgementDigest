@@ -4,7 +4,7 @@
 
 ## 現行主入口
 
-使用 [`train_model.py`](train_model.py)，預設5-fold、最多5 epochs、FP32、`time_cv=false`。主模型VALID全部完成後，只有開啟Time CV才呼叫獨立 [`judgment_bert/time_cv.py`](judgment_bert/time_cv.py)。Grid Search已完成，呼叫保留為註解，最佳encoder LR=2e-5、dropout=0.1已寫入預設config；不需先重新搜尋。
+使用 [`train_model.py`](train_model.py)，採每折內部 VALID 選 epoch、外層 TEST 報平均（完整說明：[OUTER_TEST_CV.md](OUTER_TEST_CV.md)）。預設5-fold、每折最多3 epochs、FP32、`time_cv=false`。主模型外層TEST全部完成後，只有開啟Time CV才呼叫獨立 [`judgment_bert/time_cv.py`](judgment_bert/time_cv.py)。Grid Search已完成，呼叫保留為註解，最佳encoder LR=2e-5、dropout=0.1已寫入預設config；不需先重新搜尋。
 
 完整操作與流程見 [MODEL_WORKFLOW.md](MODEL_WORKFLOW.md)，搜尋結果見 [GRID_SEARCH_RESULTS.md](GRID_SEARCH_RESULTS.md)，4萬／10萬／20萬筆的折數與epoch估時見 [TRAINING_ESTIMATES.md](TRAINING_ESTIMATES.md)。
 
@@ -38,7 +38,7 @@ python train_model.py --data /本機路徑/資料.jsonl --output runs/new_data_5
 | 法條 article | 多標籤；BCEWithLogitsLoss | sigmoid > 0.5；皆未達門檻時取最高分 |
 | 刑期 imprisonment | 單標籤多分類；CrossEntropyLoss | argmax（softmax 可用於呈現機率） |
 
-目前罪名／法條：batch 4、梯度累積 4（有效 batch 16）；AdamW，encoder LR 2e-5、分類頭 LR 1e-3、weight decay 0.01、梯度裁剪 1.0。最多 5 epochs，驗證 Macro-F1 連續 2 輪未改善即停止，保存最佳權重。warmup_ratio=0，未啟用 LR scheduler。多標籤 pos_weight 僅依訓練集計算，逐類上限 10。seed=42。
+目前罪名／法條：batch 4、梯度累積 4（有效 batch 16）；AdamW，encoder LR 2e-5、分類頭 LR 1e-3、weight decay 0.01、梯度裁剪 1.0。主入口最多 3 epochs，驗證 Macro-F1 連續 2 輪未改善即停止，保存最佳權重。warmup_ratio=0，未啟用 LR scheduler。多標籤 pos_weight 僅依訓練集計算，逐類上限 10。seed=42。
 
 程式另外支援 BERT-base、CLS／mean／attention pooling、linear／MLP head、full／last_n／frozen 微調，以及全文 chunk 的 mean／attention 聚合；這些是可選變體，並非上述兩份設定的預設。直接執行 CLI 而未載入 config 時，預設為 BERT-base、linear head、full 微調。
 
@@ -128,3 +128,5 @@ python -m judgment_bert.test_evaluation --prepared runs/experiment/prepared_main
 此工具要求各 fold 的 TEST 記錄與類別順序完全相同，且所有 VALID 結果已完成。TEST 成績另存 test_summary.json 與 TEST_RESULTS.md；平均及樣本標準差描述不同模型在同一批 TEST 的表現，不是五份獨立 TEST。
 
 目前資料的來源 fold 分佈、96 類原因與評估設計差異見 [EVALUATION_ALIGNMENT.md](EVALUATION_ALIGNMENT.md)。
+
+本次變更：每折四份開發資料再切約 10% 作內部 VALID，留下的原 fold 作外層 TEST；2025 另存 holdout.jsonl。>=150 次固定類別清單目前僅提出建議，沒有自動變更類別政策。

@@ -1,4 +1,4 @@
-"""Main model entry: fixed best parameters -> balanced K-fold VALID -> optional Time CV."""
+"""Main model entry: fixed best parameters -> outer-fold TEST with internal VALID -> optional Time CV."""
 import argparse
 import json
 from pathlib import Path
@@ -64,16 +64,16 @@ def run_experiment(settings):
     # tune(tuning_fold, settings['training_config'], 'configs/accusation_grid.json', search_output)
 
     prepared=output/'prepared_main'
-    prepare_cv(data,settings['task'],prepared,mode='kfold',folds=settings['folds'],seed=settings['seed'],
+    prepare_cv(data,settings['task'],prepared,mode='kfold_test',folds=settings['folds'],seed=settings['seed'],
                first_year=settings['first_year'],test_year=settings['test_year'],
                min_label_freq=settings['min_label_freq'])
     primary=train_cv(prepared,output/'main',config)
     if not primary['complete']:
-        raise RuntimeError('Main validation is incomplete; Time CV will not run')
-    result=dict(main_validation=primary,time_cv_enabled=settings['time_cv'],final_test_evaluated=False)
+        raise RuntimeError('Main outer TEST evaluation is incomplete; Time CV will not run')
+    result=dict(main_test=primary,time_cv_enabled=settings['time_cv'],final_test_evaluated=False)
     write_json(output/'experiment_summary.json',result)
 
-    # Additional analysis is called only AFTER all primary VALID results have been saved.
+    # Additional analysis is called only AFTER all primary outer TEST results have been saved.
     if settings['time_cv']:
         from judgment_bert.time_cv import run_time_cv
         result['time_cv']=run_time_cv(data,settings['task'],output/'time_cv',config,

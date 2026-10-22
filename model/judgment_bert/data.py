@@ -85,8 +85,9 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
     if min_label_freq < 1:
         raise ValueError('min_label_freq must be positive')
     output = Path(output)
-    if any((output/f'{split}.jsonl').exists() for split in ('train','valid','test')):
+    if any((output/f'{split}.jsonl').exists() for split in ('train','valid','test','holdout')):
         raise FileExistsError(f'Refusing to replace prepared splits: {output}')
+    split_names = ('train','valid','test','holdout') if split_by_line is not None and 'holdout' in split_by_line.values() else ('train','valid','test')
     frames = defaultdict(list); skipped = Counter(); seen_documents = set()
     for line, row in iter_records(path):
         fact = row['fact'].strip()
@@ -98,7 +99,7 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
         split = 'train' if year <= train_through else 'valid' if year == valid_year else 'test' if year == test_year else None
         if split_by_line is not None:
             split = split_by_line.get(line)
-            if split not in (None, 'train', 'valid', 'test'):
+            if split not in (None, *split_names):
                 raise ValueError(f'Invalid split at source line {line}: {split}')
         if split is None:
             skipped['outside_requested_years'] += 1; continue
@@ -119,7 +120,7 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
                                   source_line=line, fact_source=meta.get('fact_source')))
     # Exact fact equality only; process chronologically, so future records never remove training records.
     seen_facts = set(); seen_case_groups = set(); cross_split_overlap = {}; removed = Counter(); case_removed = Counter()
-    for split in ('train','valid','test'):
+    for split in split_names:
         local_facts = {hashlib.sha256(r['fact'].encode()).hexdigest() for r in frames[split]}
         cross_split_overlap[split] = len(local_facts & seen_facts)
         kept = []
@@ -147,7 +148,7 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
             raise ValueError('No training labels meet the frequency threshold')
     class_set = set(classes); split_info = {}
     output.mkdir(parents=True, exist_ok=True)
-    for split in ('train','valid','test'):
+    for split in split_names:
         records = []; unknown_labels = Counter()
         for record in frames[split]:
             if task == 'imprisonment':

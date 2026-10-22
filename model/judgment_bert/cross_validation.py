@@ -63,12 +63,23 @@ def assignments(rows, groups, mode, folds, seed, test_year, task='accusation'):
         raise ValueError('No independent holdout records remain')
     base = {line: 'test' for line in holdout}
     plans = []
-    if mode == 'kfold':
+    if mode in ('kfold', 'kfold_test'):
         bins = balanced_bins(rows, pool, folds, seed, task)
-        for index, valid in enumerate(bins):
+        for index, held_out in enumerate(bins):
             split = dict(base)
             split.update((line, 'train') for group in pool for line in group)
-            split.update((line, 'valid') for line in valid)
+            if mode == 'kfold_test':
+                outer = set(held_out)
+                remaining = [group for group in pool if group[0] not in outer]
+                if len(remaining) < 10:
+                    raise ValueError('Internal VALID needs at least 10 independent training groups')
+                # Select one balanced tenth for VALID; train only ONE model per outer fold.
+                internal_valid = balanced_bins(rows, remaining, 10, seed+1000+index, task)[0]
+                split.update((line, 'holdout') for line in holdout)
+                split.update((line, 'valid') for line in internal_valid)
+                split.update((line, 'test') for line in held_out)
+            else:
+                split.update((line, 'valid') for line in held_out)
             plans.append((f'fold_{index+1:02d}', split))
     else:
         years = sorted({rows[i]['meta']['year'] for group in pool for i in group})
@@ -90,7 +101,7 @@ def assignments(rows, groups, mode, folds, seed, test_year, task='accusation'):
 
 def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=2018,
                test_year=2025, min_label_freq=30):
-    if task not in TASKS or mode not in ('kfold', 'time'):
+    if task not in TASKS or mode not in ('kfold', 'kfold_test', 'time'):
         raise ValueError('Unknown task or cross-validation mode')
     if min_label_freq < 1:
         raise ValueError('min-label-freq must be positive')
@@ -107,13 +118,21 @@ def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=20
                 source_file=Path(data).name,
                 source_sha256=hashlib.sha256(Path(data).read_bytes()).hexdigest(),
                 grouping=['case_number', 'source_url/document', 'exact stripped fact SHA256; transitive union'],
-                stratified=mode == 'kfold', removed_holdout_overlap_rows=len(removed), folds=[])
-    if mode == 'kfold':
-        info['balance'] = balance_report(rows, [[i for i,s in split.items() if s=='valid']
+                stratified=mode in ('kfold', 'kfold_test'), removed_holdout_overlap_rows=len(removed), folds=[])
+    if mode in ('kfold', 'kfold_test'):
+        score_split = 'test' if mode == 'kfold_test' else 'valid'
+        info['primary_metric_source'] = 'outer_test' if mode == 'kfold_test' else 'valid'
+        if mode == 'kfold_test':
+            info['internal_valid_fraction_target'] = 0.1
+            info['reserved_year_split'] = 'holdout'
+        info['balance'] = balance_report(rows, [[i for i,s in split.items() if s==score_split]
                                                for _,split in plans], task)
     for name, split in plans:
         manifest = prepare(data, task, output/name, test_year=test_year,
                            min_label_freq=min_label_freq, split_by_line=split)
+        if mode == 'kfold_test':
+            manifest.update(evaluation_role='outer_test', test_year=None, holdout_year=test_year,
+                            checkpoint_selection='internal VALID Macro-F1 only')
         manifest['cross_validation'] = dict(mode=mode, fold=name, seed=seed,
                                             holdout_year=test_year, n_folds=len(plans))
         write_json(output/name/'manifest.json', manifest)
@@ -122,9 +141,9 @@ def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=20
                                  splits=manifest['splits']))
         print(f'{name}: labels={manifest["num_labels"]}, '+
               ', '.join(f'{s}={manifest["splits"][s]["n"]}' for s in ('train','valid','test')), flush=True)
-    if mode == 'kfold':
+    if mode in ('kfold', 'kfold_test'):
         prepared_bins = [[json.loads(line)['source_line'] for line in
-                          (output/f['name']/'valid.jsonl').read_text().splitlines()]
+                          (output/f['name']/(score_split+'.jsonl')).read_text().splitlines()]
                          for f in info['folds']]
         info['balance_after_label_filtering'] = balance_report(rows, prepared_bins, task)
     write_json(output/'cv_manifest.json', info)
@@ -133,14 +152,17 @@ def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=20
 
 def summarize(prepared, output):
     plan = json.loads((Path(prepared)/'cv_manifest.json').read_text())
+    outer_test = plan['mode'] == 'kfold_test'
     results = []; missing = []; common_settings = None
     for fold in plan['folds']:
         name = fold['name']; path = Path(output)/name/'metrics.json'
         if not path.exists():
             missing.append(name); continue
         result = json.loads(path.read_text())
-        if result.get('tiny_random_smoke') or result.get('fixed_epochs') or result.get('test_status') != 'not_evaluated':
+        if result.get('tiny_random_smoke') or result.get('fixed_epochs') or result.get('test_status') != ('evaluated' if outer_test else 'not_evaluated'):
             raise ValueError(f'{name}: smoke results or test evaluation cannot enter CV summary')
+        if outer_test and (result.get('evaluation_role') != 'outer_test' or 'test' not in result):
+            raise ValueError(f'{name}: missing independently evaluated outer TEST')
         trained_manifest = json.loads((Path(output)/name/'data_manifest.json').read_text())
         expected = json.loads((Path(prepared)/name/'manifest.json').read_text())
         if trained_manifest != expected:
@@ -152,12 +174,21 @@ def summarize(prepared, output):
         common_settings = comparable
         best = next(epoch for epoch in result['history']
                     if epoch['valid']['macro_f1'] == result['best_valid_macro_f1'])
-        results.append(dict(fold=name, selected_epoch=best['epoch'], valid=best['valid']))
+        entry=dict(fold=name, selected_epoch=best['epoch'], valid=best['valid'])
+        if outer_test: entry['test']=result['test']
+        results.append(entry)
     summary = dict(mode=plan['mode'], expected_folds=plan['n_folds'], completed_folds=len(results),
                    complete=not missing, missing_folds=missing, folds=results,
                    note='Unweighted mean and sample SD of selected validation scores; no TEST scores. '
                         'Fold label spaces are fitted independently; these are not pooled OOF metrics.')
+    summary['primary_metric_source']='outer_test' if outer_test else 'valid'
+    if outer_test:
+        summary['note']='Unweighted mean and sample SD of untouched outer-fold TEST scores after internal VALID checkpoint selection; reserved year is not included. Fold label spaces still fit TRAIN independently.'
     if results:
+        if outer_test:
+            summary['test'] = {metric: dict(mean=statistics.mean(r['test'][metric] for r in results),
+                sample_std=statistics.stdev(r['test'][metric] for r in results) if len(results)>1 else None)
+                for metric in results[0]['test'] if isinstance(results[0]['test'][metric], (float, int))}
         summary['validation'] = {metric: dict(mean=statistics.mean(r['valid'][metric] for r in results),
             sample_std=statistics.stdev(r['valid'][metric] for r in results) if len(results)>1 else None)
             for metric in results[0]['valid'] if isinstance(results[0]['valid'][metric], (float, int))}
@@ -175,7 +206,7 @@ def train_cv(prepared, output, config, selected=None):
     settings = json.loads(Path(config).read_text())
     if any(settings.get(key) for key in ('fixed_epochs','tiny_smoke','check_data')):
         raise ValueError('CV requires formal validation-based training, without fixed_epochs/tiny_smoke/check_data')
-    settings['evaluate_test'] = False
+    settings['evaluate_test'] = plan['mode'] == 'kfold_test'
     settings['expected_min_label_freq'] = plan['min_label_freq']
     run_plan = dict(settings={k:v for k,v in settings.items() if k not in ('data_dir','output')},
                     prepared_manifest=plan)
@@ -195,7 +226,8 @@ def train_cv(prepared, output, config, selected=None):
         settings.update(data_dir=str(prepared/name), output=str(run))
         write_json(run/'cv_config.json', settings)
         subprocess.run([sys.executable, '-m', 'judgment_bert.train',
-                        '--config', str(run/'cv_config.json'), '--no-evaluate-test'], check=True)
+                        '--config', str(run/'cv_config.json'),
+                        '--evaluate-test' if settings['evaluate_test'] else '--no-evaluate-test'], check=True)
     return summarize(prepared, output)
 
 
@@ -206,7 +238,7 @@ def main():
     prep.add_argument('--data', type=Path, required=True)
     prep.add_argument('--task', choices=TASKS, default='accusation')
     prep.add_argument('--output', type=Path, required=True)
-    prep.add_argument('--mode', choices=['kfold', 'time'], default='kfold')
+    prep.add_argument('--mode', choices=['kfold_test', 'kfold', 'time'], default='kfold_test')
     prep.add_argument('--folds', type=int, default=5, help='K-fold count (default: 5; use 10 for ten-fold CV)')
     prep.add_argument('--seed', type=int, default=42)
     prep.add_argument('--first-year', type=int, default=2018)

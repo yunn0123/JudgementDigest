@@ -14,12 +14,13 @@ def read_json(path):
 def test_plan(prepared):
     prepared = Path(prepared)
     plan = read_json(prepared / 'cv_manifest.json')
+    filename = 'holdout.jsonl' if plan.get('mode') == 'kfold_test' else 'test.jsonl'
     reference = None
     result = []
     for fold in plan['folds']:
         name = fold['name']
         manifest = read_json(prepared / name / 'manifest.json')
-        raw = (prepared / name / 'test.jsonl').read_bytes()
+        raw = (prepared / name / filename).read_bytes()
         signature = (manifest['classes'], hashlib.sha256(raw).hexdigest())
         if reference is not None and signature != reference:
             raise ValueError('TEST records and label spaces must match across all folds')
@@ -27,7 +28,7 @@ def test_plan(prepared):
         rows = [json.loads(line) for line in raw.splitlines()]
         if not rows or any(row['year'] != plan['test_year'] for row in rows):
             raise ValueError('TEST must contain only the reserved test year')
-        result.append(dict(name=name, manifest=manifest, test_sha256=signature[1], n=len(rows)))
+        result.append(dict(name=name, filename=filename, manifest=manifest, test_sha256=signature[1], n=len(rows)))
     if len(result) < 2:
         raise ValueError('Need at least two folds')
     return plan, result
@@ -56,8 +57,10 @@ def run(prepared, runs, output):
         metrics = read_json(folder / 'metrics.json')
         if metrics.get('tiny_random_smoke') or metrics.get('fixed_epochs'):
             raise ValueError('Formal VALID-selected checkpoints required')
-        if metrics.get('test_status') != 'not_evaluated':
+        if metrics.get('test_status') != ('evaluated' if plan.get('mode')=='kfold_test' else 'not_evaluated'):
             raise ValueError('Expected checkpoints selected without TEST evaluation')
+        if plan.get('mode')=='kfold_test' and metrics.get('evaluation_role')!='outer_test':
+            raise ValueError('Expected outer TEST evaluation before reserved-year scoring')
         if read_json(folder / 'data_manifest.json') != fold['manifest']:
             raise ValueError('Training manifest differs from prepared data')
         if not (folder / 'best.pt').is_file():
@@ -70,7 +73,7 @@ def run(prepared, runs, output):
         training = read_json(folder / 'metrics.json')
         selected_epoch = next(item['epoch'] for item in training['history']
                               if item['valid']['macro_f1'] == training['best_valid_macro_f1'])
-        rows = [json.loads(line) for line in (prepared / name / 'test.jsonl').read_text().splitlines()]
+        rows = [json.loads(line) for line in (prepared / name / fold['filename']).read_text().splitlines()]
         rows, filtering = filter_to_classes(rows, manifest['classes'], manifest['kind'])
         if len(rows) != fold['n']:
             raise ValueError('Prepared TEST unexpectedly changed during label filtering')

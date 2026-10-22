@@ -1,3 +1,5 @@
+> 現行主入口已改為每折內部 VALID 選模、外層 TEST 評分，見 [OUTER_TEST_CV.md](OUTER_TEST_CV.md)。以下保留舊協定的紀錄／指令／估算，不代表新協定的訓練結果。
+
 # 訓練耗時估算
 
 以下是**FP32、Apple M4 Mac mini 16GB、MPS**下的近似估算，保持法律ELECTRA最後兩層微調、max_length=512、batch=4、grad_accum=4。不是Kaggle GPU或AMP的實測時間。
