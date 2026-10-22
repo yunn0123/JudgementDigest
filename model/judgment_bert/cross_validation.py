@@ -100,7 +100,7 @@ def assignments(rows, groups, mode, folds, seed, test_year, task='accusation'):
 
 
 def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=2018,
-               test_year=2025, min_label_freq=30):
+               test_year=2025, min_label_freq=30, class_list=None, split_plan=None):
     if task not in TASKS or mode not in ('kfold', 'kfold_test', 'time'):
         raise ValueError('Unknown task or cross-validation mode')
     if min_label_freq < 1:
@@ -110,8 +110,47 @@ def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=20
         raise FileExistsError(f'Refusing to replace CV directory: {output}')
     if first_year >= test_year:
         raise ValueError('first-year must precede test-year')
+    fixed_classes = None
+    class_metadata = None
+    if class_list is not None:
+        class_metadata = json.loads(Path(class_list).read_text())
+        fixed_classes = class_metadata.get(task)
+        if not isinstance(fixed_classes,list) or not fixed_classes:
+            raise ValueError('Class list is missing this task')
+        if class_metadata.get('min_source_frequency') != min_label_freq:
+            raise ValueError('Class list source threshold differs from min_label_freq')
     rows, groups = grouped_rows(data, task, first_year, test_year)
-    plans, removed = assignments(rows, groups, mode, folds, seed, test_year, task)
+    if split_plan is None:
+        plans, removed = assignments(rows, groups, mode, folds, seed, test_year, task)
+    else:
+        source_plan = json.loads((Path(split_plan)/'cv_manifest.json').read_text())
+        expected = dict(mode=mode,n_folds=folds,seed=seed,first_year=first_year,test_year=test_year,
+                        source_sha256=hashlib.sha256(Path(data).read_bytes()).hexdigest())
+        if mode!='kfold_test' or any(source_plan.get(k)!=v for k,v in expected.items()):
+            raise ValueError('Shared split plan differs in data or split configuration')
+        plans=[]
+        for fold in source_plan['folds']:
+            name=fold['name']
+            if Path(name).name!=name:
+                raise ValueError('Invalid fold name')
+            split={int(k):v for k,v in json.loads((Path(split_plan)/name/'split_assignment.json').read_text()).items()}
+            if not set(split)<=set(rows) or set(split.values())!={'train','valid','test','holdout'}:
+                raise ValueError('Shared plan has unknown records or split roles')
+            for group in groups:
+                if len({split[i] for i in group if i in split})>1:
+                    raise ValueError('Shared plan splits a case or identical fact across roles')
+            if any((rows[i]['meta']['year']==test_year)!=(role=='holdout') for i,role in split.items()):
+                raise ValueError('Shared plan violates reserved-year isolation')
+            plans.append((name,split))
+        development={i for i,row in rows.items() if row['meta']['year']<test_year}
+        if len(plans)!=folds or len({name for name,_ in plans})!=folds:
+            raise ValueError('Shared plan has an inconsistent fold count')
+        if any(not development<=set(split) for _,split in plans):
+            raise ValueError('Shared plan omits development records')
+        test_counts=Counter(i for _,split in plans for i,role in split.items() if role=='test')
+        if set(test_counts)!=development or any(n!=1 for n in test_counts.values()):
+            raise ValueError('Shared plan must test each development record exactly once')
+        removed=[i for i,row in rows.items() if row['meta']['year']==test_year and all(i not in split for _,split in plans)]
     output.mkdir(parents=True)
     info = dict(task=task, mode=mode, seed=seed, first_year=first_year, test_year=test_year,
                 n_folds=len(plans), min_label_freq=min_label_freq,
@@ -119,6 +158,12 @@ def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=20
                 source_sha256=hashlib.sha256(Path(data).read_bytes()).hexdigest(),
                 grouping=['case_number', 'source_url/document', 'exact stripped fact SHA256; transitive union'],
                 stratified=mode in ('kfold', 'kfold_test'), removed_holdout_overlap_rows=len(removed), folds=[])
+    if split_plan is not None:
+        info['shared_split_plan_task']=source_plan['task']
+        info['shared_split_plan_manifest_sha256']=hashlib.sha256((Path(split_plan)/'cv_manifest.json').read_bytes()).hexdigest()
+    if class_metadata is not None:
+        info['fixed_class_list'] = class_metadata
+        info['fixed_class_list_sha256'] = hashlib.sha256(Path(class_list).read_bytes()).hexdigest()
     if mode in ('kfold', 'kfold_test'):
         score_split = 'test' if mode == 'kfold_test' else 'valid'
         info['primary_metric_source'] = 'outer_test' if mode == 'kfold_test' else 'valid'
@@ -129,7 +174,7 @@ def prepare_cv(data, task, output, mode='kfold', folds=5, seed=42, first_year=20
                                                for _,split in plans], task)
     for name, split in plans:
         manifest = prepare(data, task, output/name, test_year=test_year,
-                           min_label_freq=min_label_freq, split_by_line=split)
+                           min_label_freq=min_label_freq, split_by_line=split, fixed_classes=fixed_classes)
         if mode == 'kfold_test':
             manifest.update(evaluation_role='outer_test', test_year=None, holdout_year=test_year,
                             checkpoint_selection='internal VALID Macro-F1 only')
@@ -244,6 +289,8 @@ def main():
     prep.add_argument('--first-year', type=int, default=2018)
     prep.add_argument('--test-year', type=int, default=2025)
     prep.add_argument('--min-label-freq', type=int, default=30)
+    prep.add_argument('--split-plan', type=Path, help='Reuse another task exact source-line assignments')
+    prep.add_argument('--class-list', type=Path, help='Fixed source-frequency class list; disable per-fold filtering')
     for command in ('train', 'summarize'):
         child = commands.add_parser(command)
         child.add_argument('--prepared', type=Path, required=True)
@@ -254,7 +301,7 @@ def main():
     args = parser.parse_args()
     if args.command == 'prepare':
         prepare_cv(args.data, args.task, args.output, args.mode, args.folds, args.seed,
-                   args.first_year, args.test_year, args.min_label_freq)
+                   args.first_year, args.test_year, args.min_label_freq, args.class_list, args.split_plan)
     elif args.command == 'train':
         print(json.dumps(train_cv(args.prepared, args.output, args.config, args.fold), ensure_ascii=False, indent=2))
     else:

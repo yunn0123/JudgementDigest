@@ -25,7 +25,7 @@
   "pos_weight_cap": 10.0,
   "threshold": 0.5,
   "seed": 42,
-  "expected_min_label_freq": 30,
+  "expected_min_label_freq": 150,
   "device": "auto",
   "evaluate_test": false,
   "precision": "fp32"

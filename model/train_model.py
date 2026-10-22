@@ -10,6 +10,8 @@ def parse_args(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=Path('configs/accusation_experiment.json'))
     parser.add_argument('--data',type=Path)
+    parser.add_argument('--class-list',type=Path)
+    parser.add_argument('--split-plan',type=Path)
     parser.add_argument('--output',type=Path)
     parser.add_argument('--folds',type=int)
     parser.add_argument('--epochs',type=int)
@@ -24,12 +26,12 @@ def parse_args(argv=None):
         parser.error(f'Cannot read experiment config: {exc}')
     if not isinstance(settings,dict):parser.error('Experiment config must be a JSON object')
     allowed={'data','output','training_config','task','folds','epochs','precision','time_cv',
-             'first_year','test_year','min_label_freq','seed','device'}
+             'first_year','test_year','min_label_freq','seed','device','class_list','split_plan'}
     if set(settings)-allowed:
         parser.error(f'Unknown experiment keys: {sorted(set(settings)-allowed)}')
-    missing=allowed-{'time_cv','precision','device'}-set(settings)
+    missing=allowed-{'time_cv','precision','device','class_list','split_plan'}-set(settings)
     if missing:parser.error(f'Missing experiment keys: {sorted(missing)}')
-    for key in ('data','output','folds','epochs','precision','time_cv','device'):
+    for key in ('data','output','folds','epochs','precision','time_cv','device','class_list','split_plan'):
         value=getattr(args,key)
         if value is not None:settings[key]=str(value) if isinstance(value,Path) else value
     settings.setdefault('time_cv',False)
@@ -66,7 +68,7 @@ def run_experiment(settings):
     prepared=output/'prepared_main'
     prepare_cv(data,settings['task'],prepared,mode='kfold_test',folds=settings['folds'],seed=settings['seed'],
                first_year=settings['first_year'],test_year=settings['test_year'],
-               min_label_freq=settings['min_label_freq'])
+               min_label_freq=settings['min_label_freq'], class_list=settings.get('class_list'), split_plan=settings.get('split_plan'))
     primary=train_cv(prepared,output/'main',config)
     if not primary['complete']:
         raise RuntimeError('Main outer TEST evaluation is incomplete; Time CV will not run')
@@ -78,7 +80,7 @@ def run_experiment(settings):
         from judgment_bert.time_cv import run_time_cv
         result['time_cv']=run_time_cv(data,settings['task'],output/'time_cv',config,
             first_year=settings['first_year'],test_year=settings['test_year'],
-            min_label_freq=settings['min_label_freq'],seed=settings['seed'])
+            min_label_freq=settings['min_label_freq'],seed=settings['seed'],class_list=settings.get('class_list'))
         write_json(output/'experiment_summary.json',result)
     return result
 

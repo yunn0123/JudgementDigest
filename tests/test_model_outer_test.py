@@ -81,5 +81,28 @@ class OuterTestCV(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'10 independent'):
             assignments(rows,[[i] for i in rows],'kfold_test',5,42,2025)
 
+    def test_fixed_classes_bypass_fold_threshold_and_shared_task_reuses_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp);source=p/'source.jsonl'
+            records=[row(i,2020+i%5) for i in range(120)]+[row(121,2025)]
+            records[0]['meta']['accusation'].append('rare')
+            source.write_text(''.join(json.dumps(x)+'\n' for x in records))
+            class_list=p/'classes.json'
+            class_list.write_text(json.dumps(dict(min_source_frequency=150,accusation=['rare','A'],article=['L'])))
+            accusation=prepare_cv(source,'accusation',p/'acc',mode='kfold_test',min_label_freq=150,class_list=class_list)
+            article=prepare_cv(source,'article',p/'art',mode='kfold_test',min_label_freq=150,
+                               class_list=class_list,split_plan=p/'acc')
+            for fold in accusation['folds']:
+                name=fold['name'];m=json.loads((p/'acc'/name/'manifest.json').read_text())
+                self.assertEqual(m['classes'],['rare','A'])
+                self.assertFalse(m['training_frequency_filter_applied'])
+                self.assertLess(m['training_label_frequencies'].get('rare',0),150)
+                self.assertEqual((p/'acc'/name/'split_assignment.json').read_bytes(),
+                                 (p/'art'/name/'split_assignment.json').read_bytes())
+            self.assertEqual(article['shared_split_plan_task'],'accusation')
+            wrong=p/'wrong.json';wrong.write_text(json.dumps(dict(min_source_frequency=30,accusation=['A'])))
+            with self.assertRaisesRegex(ValueError,'threshold'):
+                prepare_cv(source,'accusation',p/'bad',mode='kfold_test',min_label_freq=150,class_list=wrong)
+
 
 if __name__=='__main__':unittest.main()

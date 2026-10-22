@@ -77,7 +77,7 @@ def filter_to_classes(records, classes, kind='multilabel'):
 
 def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2025,
             min_label_freq=30, deduplicate_facts=True, include_detention=False, mtl_bins=False, split_by_line=None,
-            required_splits=('train', 'valid', 'test')):
+            required_splits=('train', 'valid', 'test'), fixed_classes=None):
     if task not in TASKS:
         raise ValueError(f'Unknown task: {task}')
     if split_by_line is None and not train_through < valid_year < test_year:
@@ -143,7 +143,14 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
             classes.append('detention')
     else:
         frequency.update(label for row in frames['train'] for label in row['true_labels'])
-        classes = sorted(k for k,v in frequency.items() if v >= min_label_freq)
+        if fixed_classes is not None:
+            if (not isinstance(fixed_classes,list) or not fixed_classes
+                    or any(not isinstance(x,str) or not x.strip() for x in fixed_classes)
+                    or len(set(fixed_classes)) != len(fixed_classes)):
+                raise ValueError('fixed_classes must be a nonempty unique list of labels')
+            classes = list(fixed_classes)
+        else:
+            classes = sorted(k for k,v in frequency.items() if v >= min_label_freq)
         if not classes:
             raise ValueError('No training labels meet the frequency threshold')
     class_set = set(classes); split_info = {}
@@ -171,6 +178,8 @@ def prepare(path, task, output, train_through=2023, valid_year=2024, test_year=2
         raise ValueError('A split is empty; inspect requested years and task eligibility')
     manifest = dict(include_detention=include_detention, mtl_bins=mtl_bins, label_filter_policy='train_classes_all_splits_drop_empty', task=task, classes=classes, num_labels=len(classes),
                     kind='multiclass' if task=='imprisonment' else 'multilabel',
+                    class_policy='fixed_source_class_list' if fixed_classes is not None else 'per_fold_train_frequency',
+                    training_frequency_filter_applied=fixed_classes is None,
                     source_file=Path(path).name, source_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
                     split_policy='explicit_source_lines' if split_by_line is not None else 'calendar_years',
                     train_through=None if split_by_line is not None else train_through,

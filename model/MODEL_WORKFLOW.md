@@ -1,3 +1,5 @@
+> 最新資料／類別政策：全國 2016–2025 候選 ≥150，固定 80 類罪名／102 類法條，不再逐折篩類別。共用分配與指令見 [NATIONAL150_SHARED_DATA.md](NATIONAL150_SHARED_DATA.md)。以下舊資料數字以新版說明為準。
+
 # 模型訓練流程
 
 主入口 `train_model.py`：固定 grid search 最佳參數 → 群組平衡 5-fold → 每折內部 VALID 選 epoch → 外層 TEST 評一次 → 彙整 TEST 平均與標準差。預設每個模型最多 3 epochs、FP32、TimeCV 關閉。
