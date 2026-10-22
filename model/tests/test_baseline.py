@@ -159,6 +159,21 @@ class TestBert(unittest.TestCase):
             with self.assertRaises(ValueError):chunk_token_ids([1],4,4)
 
 
+
+class TestNonemptyPrediction(unittest.TestCase):
+    def test_empty_predictions_fall_back_to_argmax(self):
+        scores=metrics([[-4.,-5.]],[['A']],['A','B'],'multilabel')
+        self.assertEqual(scores['micro_f1'],1.)
+        self.assertEqual(scores['prediction_policy'],'at_least_one')
+        legacy=metrics([[-4.,-5.]],[['A']],['A','B'],'multilabel',require_one=False)
+        self.assertEqual(legacy['micro_f1'],0.)
+
+    def test_threshold_tie_and_existing_multilabel_predictions(self):
+        tie=metrics([[0.,0.]],[['A']],['A','B'],'multilabel')
+        self.assertEqual(tie['subset_accuracy'],1.)
+        multiple=metrics([[3.,4.]],[['A','B']],['A','B'],'multilabel')
+        self.assertEqual(multiple['subset_accuracy'],1.)
+
 if __name__=='__main__':
     torch.set_num_threads(1)
     unittest.main()

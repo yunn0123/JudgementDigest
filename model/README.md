@@ -34,8 +34,8 @@ python train_model.py --data /本機路徑/資料.jsonl --output runs/new_data_5
 
 | 任務 | 標籤與 loss | 推論 |
 |---|---|---|
-| 罪名 accusation | 多標籤；BCEWithLogitsLoss | sigmoid，門檻 0.5 |
-| 法條 article | 多標籤；BCEWithLogitsLoss | sigmoid，門檻 0.5 |
+| 罪名 accusation | 多標籤；BCEWithLogitsLoss | sigmoid > 0.5；皆未達門檻時取最高分 |
+| 法條 article | 多標籤；BCEWithLogitsLoss | sigmoid > 0.5；皆未達門檻時取最高分 |
 | 刑期 imprisonment | 單標籤多分類；CrossEntropyLoss | argmax（softmax 可用於呈現機率） |
 
 目前罪名／法條：batch 4、梯度累積 4（有效 batch 16）；AdamW，encoder LR 2e-5、分類頭 LR 1e-3、weight decay 0.01、梯度裁剪 1.0。最多 5 epochs，驗證 Macro-F1 連續 2 輪未改善即停止，保存最佳權重。warmup_ratio=0，未啟用 LR scheduler。多標籤 pos_weight 僅依訓練集計算，逐類上限 10。seed=42。
@@ -52,7 +52,10 @@ python train_model.py --data /本機路徑/資料.jsonl --output runs/new_data_5
 | `judgment_bert/data.py` | CAIL JSONL 前處理、年份切分、標籤篩選、刑期分組及去重 |
 | `judgment_bert/analyze.py` | 前處理共用的資料讀取，以及 token 長度統計 |
 | `configs/` | 現有罪名／法條實驗設定 |
-| `tests/` | 架構、前處理、設定與刑期邊界測試，使用合成資料 |
+| `evaluate.py` | 與 PR #16 對齊的 NumPy 共用切分／評分；at_least_one 與 multilabel_scores |
+| `judgment_bert/test_evaluation.py` | 所有 fold 完成後，以 VALID 最佳 checkpoint 評估同一保留年度 TEST |
+| `../tests/test_model*.py` | 不依賴 torch 的切分、刑期邊界、實驗流程與共用評分測試，既有 CI 會執行 |
+| `tests/` | 需要 torch 的架構、AMP、設定與 checkpoint 評估測試，使用合成資料 |
 
 ## 安裝與執行
 
@@ -107,3 +110,21 @@ python -m judgment_bert.data \
 ## 既有研究入口
 
 直接操作單fold搜尋、固定設定CV的舊入口仍保留，見 [CROSS_VALIDATION.md](CROSS_VALIDATION.md)。目前主程式直接使用已選設定，不再先跑搜尋。先前巢狀訓練已取消，程式及結果保留供重現，見 [NESTED_CV.md](NESTED_CV.md)。
+
+## 與 baseline 共用評估與 CI
+
+統一使用 `model/` 作為模型目錄。本次納入 PR #16 的 `models/evaluate.py` 與其離線測試，保留原本函式介面並置於 `model/evaluate.py`；baseline 的訓練檔仍由 PR #16 在合併後移入，沒有在兩個 PR 各複製一套。ELECTRA 呼叫相同的 `at_least_one` 與 `multilabel_scores`：sigmoid 分數嚴格大於 0.5 為正例；若皆未達門檻，選最高分一類。相同最高分時採類別順序的第一個。
+
+新執行的訓練／VALID／TEST 均使用至少一類規則，metrics 另記錄 prediction_policy。正在執行的歷史 run 不改既有 VALID 選模規則，避免 fold 間混用；其事後 TEST 明確採新規則並另存結果。改變預測規則無須重訓權重，但不能把舊 VALID 分數宣稱為新規則結果。
+
+NumPy-only 測試已移到根目錄 `tests/`，由現有 CI 的 `python -m unittest discover -s tests -t . -v` 執行；不在爬蟲 CI 安裝 torch。模型測試仍可在安裝 model/requirements.txt 後，於 model/ 執行 `python -m unittest discover -s tests -v`。
+
+獨立最終 TEST 評估（不重新訓練、不使用 TEST 選 checkpoint）：
+
+```sh
+python -m judgment_bert.test_evaluation --prepared runs/experiment/prepared_main --runs runs/experiment/main --output runs/experiment/test_2025
+```
+
+此工具要求各 fold 的 TEST 記錄與類別順序完全相同，且所有 VALID 結果已完成。TEST 成績另存 test_summary.json 與 TEST_RESULTS.md；平均及樣本標準差描述不同模型在同一批 TEST 的表現，不是五份獨立 TEST。
+
+目前資料的來源 fold 分佈、96 類原因與評估設計差異見 [EVALUATION_ALIGNMENT.md](EVALUATION_ALIGNMENT.md)。

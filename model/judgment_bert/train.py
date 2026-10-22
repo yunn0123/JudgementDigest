@@ -17,6 +17,7 @@ from transformers import AutoTokenizer, BertConfig, BertModel, get_linear_schedu
 from .encoding import FactDataset, Collator
 from .model import SingleTaskBert
 from .data import filter_to_classes
+from evaluate import at_least_one, multilabel_scores
 
 
 def resolve_device(name='auto'):
@@ -49,21 +50,24 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def metrics(logits, truth, classes, kind, threshold=.5):
+def metrics(logits, truth, classes, kind, threshold=.5, require_one=True):
     if kind=='multiclass':
         pred=np.argmax(logits,axis=1)
         return dict(accuracy=float(accuracy_score(truth,pred)),
                     macro_f1=float(f1_score(truth,pred,labels=list(range(len(classes))),average='macro',zero_division=0)))
-    predictions=[{classes[i] for i,p in enumerate(row) if p>=threshold}
-                 for row in torch.sigmoid(torch.as_tensor(logits)).numpy()]
+    scores=torch.sigmoid(torch.as_tensor(logits)).numpy()
+    predicted=at_least_one(scores,threshold) if require_one else (scores>=threshold).astype(int)
+    predictions=[{classes[i] for i,value in enumerate(row) if value} for row in predicted]
     truth=[set(row) for row in truth]
     if any(row-set(classes) for row in truth):
         raise ValueError('Evaluation truth contains labels outside the trained classes; filter records first')
     universe=list(classes)
     encoder=MultiLabelBinarizer(classes=universe); encoder.fit([[]])
     y=encoder.transform(truth); p=encoder.transform(predictions)
-    return dict(micro_f1=float(f1_score(y,p,average='micro',zero_division=0)),
-                macro_f1=float(f1_score(y,p,average='macro',zero_division=0)),
+    shared=multilabel_scores(y,p)
+    return dict(micro_f1=shared['micro'],
+                macro_f1=shared['macro'],
+                prediction_policy='at_least_one' if require_one else 'allow_empty',
                 micro_precision=float(precision_score(y,p,average='micro',zero_division=0)),
                 micro_recall=float(recall_score(y,p,average='micro',zero_division=0)),
                 subset_accuracy=float(accuracy_score(y,p)),
@@ -107,7 +111,7 @@ def format_training_summary(result):
     return '\n\n'.join(sections)+'\n'
 
 
-def evaluate(model,loader,device,records,manifest,threshold,precision='fp32'):
+def evaluate(model,loader,device,records,manifest,threshold,precision='fp32',require_one=True):
     model.eval(); logits=[]; indexes=[]
     with torch.no_grad():
         for batch,_,idx in loader:
@@ -116,7 +120,7 @@ def evaluate(model,loader,device,records,manifest,threshold,precision='fp32'):
             logits.append(prediction.float().cpu().numpy())
             indexes.extend(idx)
     truth=[records[i]['true_labels'] for i in indexes]
-    return metrics(np.concatenate(logits),truth,manifest['classes'],manifest['kind'],threshold)
+    return metrics(np.concatenate(logits),truth,manifest['classes'],manifest['kind'],threshold,require_one)
 
 
 def parse_args(argv=None):
