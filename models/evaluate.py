@@ -100,14 +100,26 @@ def load_shared(path: str, article_field: str = "relevant_articles"):
     """回傳 (rows, assignments, classes)。rows 依 sample_line_1based 對應，並逐筆核對 jid。"""
     import csv
     import os
-    rows = load(os.path.join(path, "shared_100k.jsonl"), article_field)
+    suffix = article_field == "relevant_articles_with_suffix"
+    data_name = "shared_100k_with_article_suffix.jsonl" if suffix else "shared_100k.jsonl"
+    rows = load(os.path.join(path, data_name), article_field)
     with open(os.path.join(path, "shared_fold_assignments.csv"), encoding="utf-8-sig") as f:
         assignments = list(csv.DictReader(f))
+    if len(assignments) != len(rows) or sorted(int(a["sample_line_1based"]) for a in assignments) != list(range(1, len(rows) + 1)):
+        raise ValueError("共用分配必須完整且不重複地對應資料行號")
     for a in assignments:
         if rows[int(a["sample_line_1based"]) - 1]["jid"] != a["jid"]:
             raise ValueError(f"jid 對不上：第 {a['sample_line_1based']} 行")
-    with open(os.path.join(path, "fixed_classes.json"), encoding="utf-8") as f:
+    classes_name = "fixed_classes_coarse.json" if suffix else "fixed_classes.json"
+    with open(os.path.join(path, classes_name), encoding="utf-8") as f:
         fixed = json.load(f)
+    if suffix:
+        with open(os.path.join(path, "fixed_classes_suffix.json"), encoding="utf-8") as f:
+            fixed["article"] = json.load(f)["article"]
+        allowed = set(fixed["article"])
+        for row in rows:
+            row["article"] = [label for label in row["article"] if label in allowed]
+            row["valid"]["article"] = row["valid"]["article"] and bool(row["article"])
     return rows, assignments, {"accusation": list(fixed["accusation"]), "article": list(fixed["article"])}
 
 

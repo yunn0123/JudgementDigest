@@ -1,0 +1,13 @@
+# Local datasets, analysis outputs and trained artifacts
+data/
+runs/
+reports/
+.venv/
+*.jsonl
+*.csv
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.npz
+*.npy

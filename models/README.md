@@ -1,4 +1,10 @@
+# 刑期擴充入口
+
+ELECTRA 單刑期、凍結 fastText attention、OOF 與可更新 fastText 的 MTL，見 [TERM_EXPERIMENTS.md](TERM_EXPERIMENTS.md)。
+
 # 刑事判決預測模型
+
+新增：`run_fasttext_suffix_vectors.sh` 沿用目前 fastText 參數，分別訓練罪名／保留條之幾的法條模型，從 VALID 最佳權重匯出每案 128 維向量。匯出需一併攜帶 `fasttext_export.py`；每個 fold 的兩個 `.npz` 檔供刑期 ELECTRA 讀取。完整本機流程見工作區 `JudgementDigest/model/FASTTEXT_VECTOR_WORKFLOW.md`。
 
 CAIL 格式資料集（罪名、法條、刑期三個任務）的基準模型與共用評估。所有模型都用 `evaluate.py` 讀資料、切分、算分數，分數才能互相比較。
 

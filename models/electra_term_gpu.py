@@ -22,6 +22,8 @@ import gc
 import os
 import sys
 import time
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -42,13 +44,23 @@ ap.add_argument("--dropout", type=float, default=0.1)
 ap.add_argument("--epochs", type=int, default=5, help="最多幾個 epoch")
 ap.add_argument("--patience", type=int, default=2, help="驗證分數連續幾個 epoch 沒進步就停")
 ap.add_argument("--batch", type=int, default=16, help="芸菲的 batch 4 × 累積 4 = 16")
+ap.add_argument("--grad-accum", type=int, default=1)
 ap.add_argument("--encoder-lr", type=float, default=2e-5)
 ap.add_argument("--head-lr", type=float, default=1e-3)
 ap.add_argument("--weight-decay", type=float, default=0.01)
 ap.add_argument("--limit", type=int, default=0, help="小量測試：每個角色只取前幾筆；0 = 全部")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out", default="electra_term.md")
+ap.add_argument("--fasttext-vectors", help="固定罪法向量目錄；啟用雙任務頭的刑期融合模型")
+ap.add_argument("--beta-mode", choices=['fixed', 'learnable'], default='fixed')
+ap.add_argument("--beta", type=float, default=0.2)
+ap.add_argument("--checkpoint-dir", help="保存各 fold 最佳 checkpoint 與 JSON 指標的新目錄")
 args = ap.parse_args()
+if args.grad_accum < 1:
+    ap.error('--grad-accum must be positive')
+if args.fasttext_vectors:
+    from judgment_bert.fasttext_vectors import FastTextVectorBank
+    from judgment_bert.term_fusion import FrozenFastTextDualTermModel
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_GPU = torch.cuda.device_count() if dev.type == "cuda" else 0
 print("裝置：", dev, f"{torch.cuda.get_device_name(0)} × {N_GPU}" if N_GPU else "", flush=True)
@@ -61,6 +73,7 @@ tokenizer = AutoTokenizer.from_pretrained(args.model)
 
 
 TOKENS = {}                                                   # jid → token，各輪共用，只斷詞一次
+FEATURES = {}                                                 # token-list identity → aligned fixed vectors
 
 
 def encode(rs):
@@ -102,7 +115,12 @@ def batch_tensors(ids, idx):
     m = np.zeros((len(seqs), width), dtype=np.int64)
     for j, s in enumerate(seqs):
         x[j, :len(s)] = s; m[j, :len(s)] = 1
-    return torch.from_numpy(x).to(dev, non_blocking=True), torch.from_numpy(m).to(dev, non_blocking=True)
+    tensors = (torch.from_numpy(x).to(dev, non_blocking=True), torch.from_numpy(m).to(dev, non_blocking=True))
+    if args.fasttext_vectors:
+        features = FEATURES[id(ids)]
+        selected = torch.as_tensor(idx, dtype=torch.long)
+        tensors += tuple(features[k][selected].to(dev) for k in ('accusation_vectors', 'article_vectors'))
+    return tensors
 
 
 def predict(model, ids):
@@ -152,6 +170,11 @@ def write_table():
 def run(sp, tag):
     t0 = time.time()
     data = {k: encode(v[:args.limit] if args.limit else v) for k, v in sp.items()}
+    bank = None
+    if args.fasttext_vectors:
+        bank = FastTextVectorBank(args.fasttext_vectors, tag)
+        for role, (rs, ids) in data.items():
+            FEATURES[id(ids)] = bank.batch(rs, role)
     tr, tr_ids = data["train"]
     lens = np.array([len(s) for s in tr_ids])
     print(f"[{tag}] 刑期可用：train {len(tr):,}、valid {len(data['valid'][0]):,}、test {len(data['test'][0]):,}、"
@@ -162,11 +185,20 @@ def run(sp, tag):
     ylog = torch.from_numpy(np.log1p(np.clip(mon, 0, None)).astype(np.float32))
     fin = torch.from_numpy(mon >= 0)                         # 迴歸不含死刑／無期
 
-    base = ElectraTerm().to(dev)
+    if bank is None:
+        base = ElectraTerm().to(dev)
+    else:
+        base = FrozenFastTextDualTermModel(
+            bank.metadata['accusation']['feature_dim'], bank.metadata['article']['feature_dim'],
+            beta=args.beta, learnable_beta=args.beta_mode == 'learnable', model_name=args.model,
+            finetune='last_n' if args.last_n else 'frozen', last_n=args.last_n, dropout=args.dropout,
+        ).to(dev)
     model = nn.DataParallel(base) if N_GPU > 1 else base
     enc = [p for p in base.encoder.parameters() if p.requires_grad]
-    head = [p for n, p in base.named_parameters() if not n.startswith("encoder.")]
+    head = [p for n, p in base.named_parameters() if not n.startswith("encoder.") and n != 'beta_logit']
     groups = [{"params": head, "lr": args.head_lr}] + ([{"params": enc, "lr": args.encoder_lr}] if enc else [])
+    if hasattr(base, 'beta_logit'):
+        groups.append({'params': [base.beta_logit], 'lr': args.head_lr, 'weight_decay': 0.0})
     opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler(dev.type, enabled=AMP)
     best = (-1.0, 0, None); since_best = 0; t1 = time.time()
@@ -175,6 +207,8 @@ def run(sp, tag):
         if args.last_n == 0:
             base.encoder.eval()                              # 全凍結時 encoder 的 dropout 不能開
         perm = np.random.permutation(len(tr)); tot = 0.0
+        opt.zero_grad(set_to_none=True)
+        batches = (len(perm) + args.batch - 1) // args.batch
         for i in range(0, len(perm), args.batch):
             b = perm[i:i + args.batch]; bt = torch.from_numpy(b)
             with torch.autocast(dev.type, enabled=AMP):
@@ -184,15 +218,22 @@ def run(sp, tag):
             fm = fin[bt].to(dev)
             if fm.any():
                 loss = loss + Fn.mse_loss(out["reg"][:, 0][fm], ylog[bt].to(dev)[fm])
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(head + enc, 1.0)
-            scaler.step(opt); scaler.update()
+            step = i // args.batch
+            group_start = step - step % args.grad_accum
+            divisor = min(args.grad_accum, batches - group_start)
+            scaler.scale(loss / divisor).backward()
+            if (step + 1) % args.grad_accum == 0 or step + 1 == batches:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(base.parameters(), 1.0)
+                scaler.step(opt); scaler.update()
+                opt.zero_grad(set_to_none=True)
             tot += loss.item() * len(b)
             if (i // args.batch) % 500 == 0:
                 print(f"    [{tag}] epoch {ep} {i:,}/{len(perm):,}（{time.time() - t1:.0f}s）loss {loss.item():.4f}", flush=True)
         res = evaluate(model, *data["valid"])
         res.update(切分=tag, n=len(tr), epoch=ep, loss=tot / len(perm), 秒數=time.time() - t1)
+        if bank is not None:
+            res['beta'] = float(base.effective_beta().detach().cpu())
         val_rows.append(res)
         print(f"  [{tag}] {len(tr):,} 筆 刑期 epoch {ep}/{args.epochs}（{res['秒數']:.0f}s）：loss {res['loss']:.4f}、"
               f"驗證分數 {res['驗證分數']:.4f}、" + "、".join(f"{k} {res[k]:.3f}" for k in METRICS), flush=True)
@@ -206,20 +247,40 @@ def run(sp, tag):
             print(f"  驗證分數 {args.patience} 個 epoch 沒進步，提早停止", flush=True)
             break
     base.load_state_dict(best[2])
+    if args.checkpoint_dir:
+        folder = Path(args.checkpoint_dir) / tag
+        folder.mkdir(parents=True, exist_ok=False)
+        torch.save(base.state_dict(), folder / 'best.pt')
+        tokenizer.save_pretrained(folder / 'tokenizer')
+        base.encoder.config.save_pretrained(folder / 'encoder_config')
+        if bank is not None:
+            (folder / 'fasttext_vector_metadata.json').write_text(json.dumps(bank.metadata, ensure_ascii=False, indent=2))
     for name in ("test", "holdout"):
         res = evaluate(model, *data[name])
         res.update(切分=tag, 評分=name, n=len(tr), epoch=best[1], 秒數=time.time() - t1)
         test_rows.append(res)
         print(f"[{tag}] {len(tr):,} 筆 刑期 完成，選用 epoch {best[1]}，{name}：" + "、".join(f"{k} {res[k]:.3f}" for k in METRICS), flush=True)
     write_table()
+    if args.checkpoint_dir:
+        info = dict(fold=tag, selected_epoch=best[1], best_valid_cail=best[0], args=vars(args),
+                    beta=float(base.effective_beta().detach().cpu()) if bank is not None else None,
+                    history=[r for r in val_rows if r['切分'] == tag],
+                    evaluations=[r for r in test_rows if r['切分'] == tag])
+        (folder / 'metrics.json').write_text(json.dumps(info, ensure_ascii=False, indent=2))
+    for _, ids in data.values():
+        FEATURES.pop(id(ids), None)
     del model, base, opt, best; gc.collect()
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 
 
-rows, assignments, _ = E.load_shared(args.shared)
+rows, assignments, _ = E.load_shared(args.shared, 'relevant_articles_with_suffix' if args.fasttext_vectors else 'relevant_articles')
+for i, row in enumerate(rows):
+    row['source_line'] = i + 1
 folds = E.shared_folds(assignments) if args.folds == "all" else args.folds.split(",")
 for fold in folds:
+    if args.checkpoint_dir and (Path(args.checkpoint_dir) / fold).exists():
+        raise FileExistsError(f'Refusing to overwrite checkpoint fold {fold}')
     sp = E.shared_split(rows, assignments, fold)
     sp["train"] = list(sp["train"]); np.random.RandomState(args.seed).shuffle(sp["train"])
     run(sp, fold)

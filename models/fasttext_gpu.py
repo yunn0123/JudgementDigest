@@ -42,6 +42,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import evaluate as E  # noqa: E402
+from fasttext_export import export_vectors
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--data", help="全國 CAIL 格式 .jsonl 或 .zip（與 --shared 擇一）")
@@ -62,9 +63,18 @@ ap.add_argument("--batch", type=int, default=512)
 ap.add_argument("--lr", type=float, default=0.01)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out", default="fasttext.md")
+ap.add_argument("--export-vectors", help="共用包模式：VALID 最佳罪法模型匯出案件隱向量至新目錄（不覆寫）")
+ap.add_argument("--save-checkpoints", action="store_true", help="匯出向量時另外保留最佳 fastText state_dict，供新案件抽取")
 args = ap.parse_args()
 if bool(args.data) == bool(args.shared):
     ap.error("--data 與 --shared 要擇一")
+if args.save_checkpoints and not args.export_vectors:
+    ap.error("--save-checkpoints 必須搭配 --export-vectors")
+if args.export_vectors:
+    if not args.shared:
+        ap.error("--export-vectors 必須搭配 --shared，確保案件與 fold 對齊")
+    if os.path.exists(args.export_vectors):
+        ap.error("--export-vectors 必須是尚不存在的新目錄")
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("裝置：", dev, torch.cuda.get_device_name(0) if dev.type == "cuda" else "", flush=True)
 torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -218,6 +228,20 @@ def run(pool, val, evals, sizes, mlb, tag):
                     print(f"  驗證分數 {args.patience} 個 epoch 沒進步，提早停止", flush=True)
                     break
             model.load_state_dict(best[2])
+            if args.export_vectors and task in ("accusation", "article"):
+                export_vectors(
+                    model, hv, rows, assignments, tag,
+                    [tr[i] for i in ids],
+                    os.path.join(args.export_vectors, tag, task + ".npz"),
+                    dict(task=task, article_field=args.article_field, classes=list(mlb[task].classes_),
+                         selected_epoch=best[1], valid_score=best[0], training_args=vars(args),
+                         seed=args.seed, source_config=HEADER),
+                )
+                print(f"[{tag}] {task} 案件向量已匯出至 {args.export_vectors}", flush=True)
+                if args.save_checkpoints:
+                    checkpoint = os.path.join(args.export_vectors, tag, task + ".pt")
+                    with open(checkpoint, 'xb') as handle:
+                        torch.save(model.state_dict(), handle)
             for name, rs in evals.items():
                 res = evaluate(task, model, Xev[name], rs, top, mlb)
                 res.update(切分=tag, 評分=name, n=n, 任務=task, epoch=best[1], 秒數=time.time() - t1)

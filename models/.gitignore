@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+runs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.npz
+*.npy
+*.jsonl
