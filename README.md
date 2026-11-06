@@ -24,36 +24,78 @@
 
 ## 系統架構
 
-```mermaid
-%%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false, "wrappingWidth": 400}}}%%
-flowchart LR
-    U([使用者]) --> FE["① 輸入補全<br/>固定問卷，同意後可用 LLM 追問<br/>遮名後才送出"]
-    FE --> IN["結構化輸入<br/>案由、事實<br/>請求金額、證據"]
+平台服務與離線資料處理分開；刑事模型目前採罪法 fastText、刑期 ELECTRA 各自獨立預測，尚未接入平台 API。
 
-    subgraph BE["② 預測與檢索"]
-        CIV["民事勝訴機率模型"]
-        RET["相似判決檢索<br/>刑事目前是示例資料"]
-        AMT["金額範圍<br/>證據對照、常見抗辯"]
-        ANN["判決導讀<br/>目前以規則標示"]
-        CRI["刑事（開發中）<br/>罪名／法條／刑期<br/>目前是示例資料"]
+```mermaid
+flowchart TB
+    U([使用者]) --> FE["輸入補全與遮名預覽<br/>固定問卷；同意後可用 LLM 追問"]
+    FE --> IN["結構化輸入<br/>案情事實、案由、請求金額、證據"]
+
+    subgraph ONLINE["平台服務"]
+        API["FastAPI"]
+        CIV["民事勝訴機率<br/>原告主張 TF-IDF＋案件特徵"]
+        RET["相似判決檢索<br/>民事：真實判決；刑事：示例資料"]
+        AMT["相似勝訴判決 → 金額範圍<br/>證據對照、常見抗辯"]
+        ANN["判決導讀<br/>規則標示"]
+        MOCK["刑事 API<br/>目前回傳示例資料"]
+        API --> CIV & RET & MOCK
         RET --> AMT & ANN
     end
 
-    subgraph DATA["③ 資料（離線）"]
-        CR["爬蟲<br/>全國地院判決"] --> ST["段落切分＋結構化<br/>事實、判決結果<br/>金額、刑期"]
-        ST --> DS[("結構化資料集")]
+    subgraph OFFLINE["離線資料與模型"]
+        SRC["司法院判決<br/>網頁爬取／刑事開放資料"]
+        ST["段落切分與規則萃取<br/>事實、罪名、法條、刑種／刑期、金額"]
+        DS[("結構化資料集")]
+        CM["民事模型訓練與檢索索引"]
+        CRI["刑事獨立模型<br/>罪法：fastText<br/>刑期：ELECTRA"]
         TAG["段落功能標註（開發中）<br/>LLM 輔助＋法律系驗證"]
+        SRC --> ST --> DS
+        DS --> CM
+        DS -.->|刑事組訓練流程，待整合| CRI
     end
 
-    IN --> CIV & RET & CRI
-    DS --> CIV & RET
-    DS -.-> CRI
-    TAG -.-> ANN
-    CIV & AMT & ANN & CRI --> OUT["④ 結果頁<br/>相似判決＋推估結果<br/>限制說明"]
+    IN --> API
+    CM --> CIV & RET
+    CRI -.->|待接入，取代示例資料| MOCK
+    TAG -.->|待接入| ANN
+    CIV & RET & AMT & ANN & MOCK --> OUT["結果頁<br/>真實判決或示例標示、推估結果、限制說明"]
     OUT --> U
 ```
 
-虛線是還沒接上的部分。
+實線為目前流程；虛線為待整合部分。`main` 的刑事預測與檢索仍由 `backend/mock.py` 提供示例；圖中的刑事模型是刑事組的採用方案，不代表已上線。
+
+### 刑事模型架構
+
+三項預測以同一份犯罪事實為輸入；罪名、法條與刑期各自訓練，採用版不將罪法向量送入刑期模型。
+
+```mermaid
+flowchart LR
+    FACT["犯罪事實文字"]
+
+    subgraph LABELS["罪名／法條"]
+        FT["fastText 罪法模組<br/>細部架構與指標待補"]
+        ACC["罪名預測"]
+        LAW["法條預測"]
+        FT --> ACC & LAW
+    end
+
+    subgraph TERM["刑期單任務"]
+        TOK["Tokenizer<br/>最多 512 tokens"]
+        ELE["法律 ELECTRA<br/>微調最後 6 層"]
+        CLS["CLS 向量：768 維"]
+        MLP["全連接層<br/>768 → 512 → 256<br/>ReLU＋Dropout"]
+        BIN["7 區間分類"]
+        REG["log（月數＋1）迴歸<br/>還原為預測月數"]
+        TOK --> ELE --> CLS --> MLP
+        MLP --> BIN & REG
+    end
+
+    FACT --> FT & TOK
+```
+
+刑期實驗目前僅含有期徒刑，使用分類交叉熵＋迴歸 MSE，以 VALID CAIL 選模；seed＝42、5-fold、最多 5 epochs。拘役日數另存，不混入有期徒刑月數。
+
+凍結 fastText attention 融合、OOF 罪法向量與可更新 fastText 的 MTL 為比較實驗，不屬於上圖的獨立預測方案。模型程式目前在 [刑事模型分支](https://github.com/yunn0123/JudgementDigest/tree/feat/electra-fasttext-oof-models)，執行方式見該分支的 [TERM_EXPERIMENTS.md](https://github.com/yunn0123/JudgementDigest/blob/feat/electra-fasttext-oof-models/models/TERM_EXPERIMENTS.md)；尚待依本 repo 的 `criminal/` 目錄規劃整合。
 
 ## 資料
 
